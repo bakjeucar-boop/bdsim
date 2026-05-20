@@ -47,7 +47,7 @@ from weather import (
 
 # --- 0. Streamlit 설정 및 최적화 ---
 st.set_page_config(
-    page_title="Forecast Energy — 가설건물 전력 예측",
+    page_title="가설건물 전력 사용량 예측",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -232,9 +232,9 @@ with st.sidebar:
     )
 
 # --- 4. 메인 화면 레이아웃 ---
-st.title("📊 Forecast Energy v3.0 (Streamlit)")
+st.title("📊 Forecast Energy")
 st.caption(
-    "공사현장 가설건물 전력 사용량 및 피크 부하 예측 시스템 — ISO 52016-1 물리 엔진 기반"
+    "가설건물 전력 사용량 및 피크 부하 예측 시스템 — ISO 52016-1 물리 엔진 기반"
 )
 
 tab_input, tab_list, tab_result = st.tabs(
