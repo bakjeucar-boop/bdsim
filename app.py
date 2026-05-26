@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """app.py — 가설건물 전력 예측 시스템 (Streamlit 버전)"""
 
@@ -16,6 +16,7 @@ import streamlit as st
 # 내부 모듈 임포트
 from constants import (
     DHW_FACILITY_PARAMS,
+    DHW_FACILITY_TYPES,
     DHW_HEATER_DEFAULTS,
     DHW_HEATER_TYPES,
     ISO18523_PROFILE,
@@ -47,7 +48,7 @@ from weather import (
 
 # --- 0. Streamlit 설정 및 최적화 ---
 st.set_page_config(
-    page_title="가설건물 전력 사용량 예측",
+    page_title="Forecast Energy — 가설건물 전력 예측",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -218,23 +219,22 @@ with st.sidebar:
     site_start = st.date_input(
         "예측 시작일", value=pd.Timestamp.now().date()
     )
-    site_start_time = st.time_input(
-        "예측 시작 시간", value=pd.Timestamp.now().floor("H").time()
-    )
-    start_user = pd.Timestamp.combine(site_start, site_start_time)
+    start_user = pd.Timestamp.combine(site_start, pd.Timestamp("00:00").time())
+    st.caption("예측 시작시간은 00:00으로 고정됩니다.")
 
     site_days = st.slider("예측 일수", min_value=3, max_value=16, value=7)
 
+    water_source_options = list(WATER_SOURCE_PARAMS.keys())
     water_source = st.selectbox(
         "급수 공급원",
-        options=list(WATER_SOURCE_PARAMS.keys()),
-        index=1,  # 옥상탱크(무단열)
+        options=water_source_options,
+        index=water_source_options.index("지중매설 (1m+)"),
     )
 
 # --- 4. 메인 화면 레이아웃 ---
 st.title("📊 Forecast Energy")
 st.caption(
-    "가설건물 전력 사용량 및 피크 부하 예측 시스템 — ISO 52016-1 물리 엔진 기반"
+    "가설건물 전력 사용량 및 피크 부하 예측 — ISO 52016-1 기반"
 )
 
 tab_input, tab_list, tab_result = st.tabs(
@@ -245,16 +245,20 @@ tab_input, tab_list, tab_result = st.tabs(
 with tab_input:
     st.subheader("새로운 건물 추가 또는 수정")
 
-    # 초기값 세팅을 위한 Use Preset 매핑
-    use_type = st.selectbox("용도", options=USE_TYPES, index=0)
-    preset = PRESETS[use_type]
-
     # 기본값 설정 (수정 모드 여부에 따라 분기)
     if st.session_state.edit_idx is not None:
         eb = st.session_state.buildings[st.session_state.edit_idx]
     else:
         eb = {}
 
+    # 초기값 세팅을 위한 Use Preset 매핑
+    saved_use_type = eb.get("use_type", USE_TYPES[0])
+    use_type = st.selectbox(
+        "용도",
+        options=USE_TYPES,
+        index=USE_TYPES.index(saved_use_type) if saved_use_type in USE_TYPES else 0,
+    )
+    preset = PRESETS[use_type]
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -302,21 +306,51 @@ with tab_input:
             value=float(eb.get("cool_set", preset.cool_set)),
             step=0.5,
         )
+        cop_c = st.number_input(
+            "냉방기 COP",
+            value=float(eb.get("cop_c", 3.8)),
+            min_value=0.1,
+            step=0.1,
+        )
+        cop_h = st.number_input(
+            "난방기 COP",
+            value=float(eb.get("cop_h", 3.2)),
+            min_value=0.1,
+            step=0.1,
+        )
 
-        # 식당의 경우 HVAC 시간을 자동으로 연산하므로 Disable 처리 가능
+        if use_type == "식당":
+            meal_bfst = st.checkbox(
+                "조식 제공 (05~09h)", value=bool(eb.get("meal_bfst", preset.meal_bfst))
+            )
+            meal_lunch = st.checkbox(
+                "중식 제공 (10~14h)", value=bool(eb.get("meal_lunch", preset.meal_lunch))
+            )
+            meal_dinner = st.checkbox(
+                "석식 제공 (16~21h)", value=bool(eb.get("meal_dinner", preset.meal_dinner))
+            )
+            auto_hvac_start, auto_hvac_end = get_restaurant_hvac_times(
+                meal_bfst, meal_lunch, meal_dinner
+            )
+        else:
+            meal_bfst, meal_lunch, meal_dinner = False, False, False
+            auto_hvac_start = int(eb.get("hvac_start", preset.hvac_start))
+            auto_hvac_end = int(eb.get("hvac_end", preset.hvac_end))
+
         hvac_start = st.number_input(
             "HVAC 시작 [h]",
-            value=int(eb.get("hvac_start", preset.hvac_start)),
+            value=auto_hvac_start,
             min_value=0,
             max_value=23,
+            disabled=(use_type == "식당"),
         )
         hvac_end = st.number_input(
             "HVAC 종료 [h]",
-            value=int(eb.get("hvac_end", preset.hvac_end)),
+            value=auto_hvac_end,
             min_value=0,
             max_value=23,
+            disabled=(use_type == "식당"),
         )
-
         sat_mode = st.selectbox(
             "토요일 운영",
             options=WEEKEND_MODES,
@@ -334,12 +368,19 @@ with tab_input:
 
     with col3:
         st.markdown("##### 🚰 온수 및 환기")
+        dhw_facility_options = DHW_FACILITY_TYPES
+        saved_dhw_facility = eb.get("dhw_facility", preset.default_dhw_facility)
+        saved_dhw_facility = {
+            "없음": "세면",
+            "샤워·세면": "샤워",
+            "샤워+주방": "주방+샤워",
+        }.get(saved_dhw_facility, saved_dhw_facility)
+        if saved_dhw_facility not in dhw_facility_options:
+            saved_dhw_facility = preset.default_dhw_facility
         dhw_facility = st.selectbox(
             "온수 시설 유형",
-            options=list(DHW_FACILITY_PARAMS.keys()),
-            index=list(DHW_FACILITY_PARAMS.keys()).index(
-                eb.get("dhw_facility", preset.default_dhw_facility)
-            ),
+            options=dhw_facility_options,
+            index=dhw_facility_options.index(saved_dhw_facility),
         )
         dhw_heater_type = st.selectbox(
             "온수기 종류",
@@ -356,9 +397,16 @@ with tab_input:
             min_value=0,
         )
 
-        oa_m3h = st.number_input(
-            "외기공급량 [m³/h]", value=float(eb.get("oa_m3h", preset.oa_m3h))
+        mechanical_vent = st.checkbox(
+            "기계환기 있음",
+            value=bool(eb.get("mechanical_vent", float(eb.get("oa_m3h", preset.oa_m3h)) > 0.0)),
         )
+        if mechanical_vent:
+            oa_m3h = st.number_input(
+                "외기공급량 [m³/h]", value=float(eb.get("oa_m3h", preset.oa_m3h))
+            )
+        else:
+            oa_m3h = 0.0
 
         # 식당 전용 후드 배기 설정
         if use_type == "식당":
@@ -368,12 +416,8 @@ with tab_input:
                     eb.get("kitchen_exh", preset.kitchen_exh_m3h)
                 ),
             )
-            meal_bfst = st.checkbox("조식 제공 (05~09h)", value=True)
-            meal_lunch = st.checkbox("중식 제공 (10~14h)", value=True)
-            meal_dinner = st.checkbox("석식 제공 (16~21h)", value=True)
         else:
             kitchen_exh = 0.0
-            meal_bfst, meal_lunch, meal_dinner = False, False, False
 
     # 고급 설정: 접이식 패널 (Expanders)
     with st.expander("🛠️ 고급 설정 (부하 밀도 및 외피 정보)"):
@@ -436,6 +480,7 @@ with tab_input:
         "dhw_facility": dhw_facility,
         "dhw_heater_type": dhw_heater_type,
         "dhw_persons": dhw_persons,
+        "mechanical_vent": mechanical_vent,
         "oa_m3h": oa_m3h,
         "kitchen_exh": kitchen_exh,
         "meal_bfst": meal_bfst,
@@ -453,8 +498,8 @@ with tab_input:
         # 기본 fallback 값 처리
         "gains_start": preset.gains_start,
         "gains_end": preset.gains_end,
-        "cop_h": 3.2,
-        "cop_c": 3.8,
+        "cop_h": cop_h,
+        "cop_c": cop_c,
         "vent_start": 8,
         "vent_end": 18,
         "fan_sp": 0.0,
@@ -899,3 +944,7 @@ with tab_result:
                 mime="text/csv",
                 use_container_width=True,
             )
+
+
+
+

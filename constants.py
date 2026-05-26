@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """constants.py — 가설건물 에너지 예측 시스템 상수/프로파일 모듈
 
@@ -162,7 +162,7 @@ PRESETS: Dict[str, UsePreset] = {
         base_infil_ach=0.7, oa_m3h=0.0, kitchen_exh_m3h=0.0,
         sat_mode='없음(OFF)', sun_mode='없음(OFF)',
         meal_bfst=False, meal_lunch=False, meal_dinner=False,
-        default_dhw_facility='없음', default_dhw_heater='없음',
+        default_dhw_facility='세면', default_dhw_heater='없음',
     ),
     # ── 숙소 ────────────────────────────────────────────────────
     # ISO 18523-2:2018 Annex C 기준 / 24h 7일 연속 운영
@@ -174,7 +174,7 @@ PRESETS: Dict[str, UsePreset] = {
         base_infil_ach=0.7, oa_m3h=0.0, kitchen_exh_m3h=0.0,
         sat_mode='평일 동일', sun_mode='평일 동일',
         meal_bfst=False, meal_lunch=False, meal_dinner=False,
-        default_dhw_facility='샤워·세면', default_dhw_heater='전기저항식(저장)',
+        default_dhw_facility='샤워', default_dhw_heater='전기저항식(저장)',
     ),
     # ── 작업장 ──────────────────────────────────────────────────
     # ISO 18523-1:2016 Annex D 경공업/중공업 기준
@@ -186,7 +186,7 @@ PRESETS: Dict[str, UsePreset] = {
         base_infil_ach=1.0, oa_m3h=0.0, kitchen_exh_m3h=0.0,
         sat_mode='없음(OFF)', sun_mode='없음(OFF)',
         meal_bfst=False, meal_lunch=False, meal_dinner=False,
-        default_dhw_facility='샤워·세면', default_dhw_heater='전기저항식(순간)',
+        default_dhw_facility='샤워', default_dhw_heater='전기저항식(순간)',
     ),
     # ── 식당 ────────────────────────────────────────────────────
     # ISO 18523-1:2016 Annex D 레스토랑/구내식당 기준
@@ -246,14 +246,18 @@ DHW_HEATER_DEFAULTS: Dict[str, Dict] = {
     },
 }
 
-DHW_FACILITY_TYPES = ['없음', '샤워·세면', '주방', '샤워+주방']
+DHW_FACILITY_TYPES = ['세면', '샤워', '주방', '주방+샤워']
 
 # 시설 유형별 온수 사용량 파라미터
 # shower_lpd: L/인·일,  kitchen_lpd: L/인·일
 DHW_FACILITY_PARAMS: Dict[str, Dict] = {
+    '세면':      {'shower_lpd': 10.0, 'kitchen_lpd': 0.0},
+    '샤워':      {'shower_lpd': 60.0, 'kitchen_lpd': 0.0},
+    '주방':      {'shower_lpd': 0.0,  'kitchen_lpd': 10.0},
+    '주방+샤워': {'shower_lpd': 60.0, 'kitchen_lpd': 10.0},
+    # 이전 저장값 호환
     '없음':      {'shower_lpd': 0.0,  'kitchen_lpd': 0.0},
     '샤워·세면': {'shower_lpd': 60.0, 'kitchen_lpd': 0.0},
-    '주방':      {'shower_lpd': 0.0,  'kitchen_lpd': 10.0},
     '샤워+주방': {'shower_lpd': 60.0, 'kitchen_lpd': 10.0},
 }
 
@@ -314,3 +318,6 @@ SUPPLY_TEMP_MIN = 2.0  # 급수온도 하한 [°C]
 # ============================================================
 # Open-Meteo 수집
 # ============================================================
+
+
+
