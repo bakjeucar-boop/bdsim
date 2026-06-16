@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """constants.py — 가설건물 에너지 예측 시스템 상수/프로파일 모듈
 

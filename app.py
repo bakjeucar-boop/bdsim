@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """app.py — 가설건물 전력 예측 시스템 (Streamlit 버전)"""
 
@@ -696,7 +696,6 @@ with tab_list:
                             sun_mode=bp["sun_mode"],
                             occupancy_ratio=occ_ratio,
                             restaurant_gains_prof=restaurant_gains_prof,
-                            use_type=ut,  # setback 제어용 (비주거: free-floating)
                         )
 
                         hs_year = run_iso52016_simulation(
