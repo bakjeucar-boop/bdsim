@@ -122,7 +122,7 @@ def write_epw_8760_from_open_meteo(
     elev = _to_float(meta.get('elevation', 0.0), 0.0)
     header = [
         f"LOCATION,Forecast,-,-,Open-Meteo,0,"
-        f"{meta.get('latitude',0)},{meta.get('longitude',0)},{tz_h},{elev}",
+        f"{meta.get('latitude',0)},{meta.get('longitude',0)},0,{elev}",  # timezone=0: 현지시각 그대로 사용(pybuildingenergy UTC변환 방지)
         'DESIGN CONDITIONS,0','TYPICAL/EXTREME PERIODS,0',
         'GROUND TEMPERATURES,0','HOLIDAYS/DAYLIGHT SAVING,No,0,0,0',
         'COMMENTS 1,Generated from Open-Meteo hourly forecast (8760h)',
@@ -226,3 +226,115 @@ def calc_supply_temp_series(
 
     return t_supply, warnings
 
+# ============================================================
+# 슬림 EPW 생성 (워밍업 14일 + 예측기간만)
+# ============================================================
+
+WARMUP_DAYS = 14   # 실내온도 수렴에 필요한 최소 워밍업 일수
+
+
+def build_epw_slim(
+    df_open: pd.DataFrame,
+    meta: Dict[str, Any],
+    start_user: pd.Timestamp,
+    days: int,
+    warmup_days: int = WARMUP_DAYS,
+) -> Tuple[pd.DataFrame, pd.Timestamp, int]:
+    """워밍업 + 예측기간만 포함하는 최소 EPW DataFrame 생성.
+
+    반환:
+      df_slim   : 슬림 EPW 데이터 (warmup_days + days × 24h 행)
+      epw_start : EPW 첫 번째 행의 실제 타임스탬프 (워밍업 시작)
+      n_hours   : df_slim의 총 행 수 (= (warmup_days + days) × 24)
+
+    EPW 헤더의 DATA PERIODS 를 실제 시작일로 설정하므로
+    pybuildingenergy가 올바른 날짜로 인식합니다.
+
+    워밍업 기간이 수집 범위를 벗어나면 가장 오래된 데이터를 반복 패딩합니다.
+    """
+    epw_start = start_user - pd.Timedelta(days=int(warmup_days))
+    epw_end   = start_user + pd.Timedelta(days=int(days))
+    slim_idx  = pd.date_range(start=epw_start, end=epw_end, freq='h', inclusive='left')
+    n_hours   = len(slim_idx)
+
+    # df_open 범위 확인
+    open_min = df_open.index.min()
+    open_max = df_open.index.max()
+
+    rows = {}
+    for col in df_open.columns:
+        ser = df_open[col].copy()
+        # 범위 밖은 가장 가까운 경계값으로 채움
+        reindexed = ser.reindex(slim_idx, method='nearest', tolerance='1h')
+        # 여전히 NaN 남아있으면 ffill/bfill
+        if col in ('shortwave_radiation', 'direct_normal_irradiance',
+                   'diffuse_radiation', 'precipitation'):
+            reindexed = reindexed.fillna(0.0)
+        else:
+            reindexed = reindexed.ffill().bfill().fillna(15.0)
+        rows[col] = reindexed.values
+
+    df_slim = pd.DataFrame(rows, index=slim_idx)
+    return df_slim, epw_start, n_hours
+
+
+def write_epw_slim(
+    df_slim: pd.DataFrame,
+    epw_start: pd.Timestamp,
+    meta: Dict[str, Any],
+    out_path: str,
+) -> None:
+    """슬림 EPW DataFrame을 .epw 파일로 저장.
+
+    DATA PERIODS 헤더를 실제 시작일(epw_start)로 기록하여
+    pybuildingenergy가 날짜를 올바르게 인식하도록 합니다.
+    행 수가 8760h 미만이어도 정상 동작합니다.
+    """
+    tz_h   = float(meta.get('utc_offset_seconds', 0)) / 3600.0
+    elev   = _to_float(meta.get('elevation', 0.0), 0.0)
+    n_rows = len(df_slim)
+
+    _weekday_en = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+    day_name    = _weekday_en[epw_start.weekday()]
+    end_ts   = df_slim.index[-1]
+    dp_start = f"{epw_start.month}/{epw_start.day}"
+    dp_end   = f"{end_ts.month}/{end_ts.day}"
+
+    header = [
+        f"LOCATION,Forecast,-,-,Open-Meteo,0,"
+        f"{meta.get('latitude',0)},{meta.get('longitude',0)},0,{elev}",
+        'DESIGN CONDITIONS,0',
+        'TYPICAL/EXTREME PERIODS,0',
+        'GROUND TEMPERATURES,0',
+        'HOLIDAYS/DAYLIGHT SAVING,No,0,0,0',
+        f'COMMENTS 1,Slim EPW ({n_rows}h = warmup+forecast) Generated from Open-Meteo',
+        f"COMMENTS 2,Timezone={meta.get('timezone','')}",
+        f'DATA PERIODS,1,1,Data,{day_name},{dp_start},{dp_end}',
+    ]
+
+    rows_out = []
+    for ts, r in df_slim.iterrows():
+        hr  = int(ts.hour) + 1
+        dry = _to_float(r.get('temperature_2m'), 99.9)
+        dew = _to_float(r.get('dew_point_2m'), 99.9)
+        rh  = _to_float(r.get('relative_humidity_2m'), 999.0)
+        ph  = _to_float(r.get('surface_pressure'), None)
+        ppa = 999999.0 if ph is None else ph * 100.0
+        wd  = _to_float(r.get('wind_direction_10m'), 999.0)
+        ws  = _to_float(r.get('wind_speed_10m'), 999.0)
+        cl  = _to_float(r.get('cloud_cover'), None)
+        tsc = 99 if cl is None else max(0, min(10, int(round(cl / 10.0))))
+        ghi = max(0.0, _to_float(r.get('shortwave_radiation'), 0.0))
+        dni = max(0.0, _to_float(r.get('direct_normal_irradiance'), 0.0))
+        dhi = max(0.0, _to_float(r.get('diffuse_radiation'), 0.0))
+        prc = _to_float(r.get('precipitation'), 0.0)
+        line = [ts.year, ts.month, ts.day, hr, 60, '?',
+                dry, dew, rh, ppa,
+                9999, 9999, 9999, ghi, dni, dhi,
+                999999, 999999, 999999, 9999, wd, ws, tsc, tsc,
+                9999, 99999, 9, '999999999', 999, 0.999, 999, 99, 999, prc, 1]
+        rows_out.append(','.join(map(str, line)))
+
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(header) + '\n')
+        f.write('\n'.join(rows_out) + '\n')

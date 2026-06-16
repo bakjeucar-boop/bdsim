@@ -158,6 +158,7 @@ def build_bui(
     sun_mode: str = '없음(OFF)',
     occupancy_ratio: float = 1.0,
     restaurant_gains_prof: Optional[list] = None,
+    use_type: str = '사무실',
 ) -> Dict[str, Any]:
     """BUI 딕셔너리 생성.
 
@@ -254,10 +255,12 @@ def build_bui(
         ],
         "building_parameters":{
             "temperature_setpoints":{
-                "heating_setpoint":float(heat_set),
-                "heating_setback":float(heat_set)-3.0,
-                "cooling_setpoint":float(cool_set),
-                "cooling_setback":float(cool_set)+4.0,
+                # 숙소: setback 유지 (24h 거주, 야간 최소 온도 유지)
+                # 비주거: 극단값 → HVAC 외 시간 완전 free-floating
+                "heating_setpoint": float(heat_set),
+                "heating_setback":  float(heat_set)-3.0 if use_type=='숙소' else -50.0,
+                "cooling_setpoint": float(cool_set),
+                "cooling_setback":  float(cool_set)+4.0 if use_type=='숙소' else 100.0,
             },
             "system_capacities":{
                 # ISO 52016: 에너지 소요량 계산 — 설비 용량 무제한(1e6 W)
@@ -697,4 +700,255 @@ def _iv(v, fb=0):
     except Exception:
         return int(fb)
 
+def run_iso52016_simulation_slim(
+    bui: Dict[str, Any],
+    epw_path: str,
+    epw_start: 'pd.Timestamp',
+    warmup_days: int,
+    forecast_days: int,
+) -> 'pd.DataFrame':
+    """슬림 EPW(워밍업+예측기간)로 ISO 52016 시뮬레이션 실행.
 
+    pybuildingenergy가 EPW 헤더의 DATA PERIODS를 읽어 날짜를 인식하므로,
+    write_epw_slim()이 생성한 헤더와 반드시 쌍으로 사용해야 합니다.
+
+    반환:
+      df_forecast : 예측 기간(forecast_days × 24h)만 잘라낸 DataFrame
+                    인덱스는 실제 예측 날짜·시각
+
+    워밍업 기간을 버리고 예측 기간만 반환하므로
+    extract_user_period() 호출이 불필요합니다.
+    """
+    import pybuildingenergy as pybui
+
+    bui_c, _ = pybui.sanitize_and_validate_BUI(bui, fix=True)
+    hs, _    = pybui.ISO52016.Temperature_and_Energy_needs_calculation(
+        bui_c,
+        weather_source='epw',
+        weather_file=epw_path,
+        path_weather_file=epw_path,
+    )
+    if not isinstance(hs, pd.DataFrame):
+        hs = pd.DataFrame(hs)
+
+    # 시뮬레이션 결과에 실제 날짜 인덱스 부여
+    total_hours = (warmup_days + forecast_days) * 24
+    if len(hs) >= total_hours:
+        hs = hs.iloc[:total_hours].copy()
+    real_idx = pd.date_range(
+        start=epw_start,
+        periods=len(hs),
+        freq='h',
+    )
+    hs.index = real_idx
+
+    # 워밍업 기간 제거 → 예측 기간만 반환
+    forecast_start = epw_start + pd.Timedelta(days=int(warmup_days))
+    df_forecast    = hs.loc[hs.index >= forecast_start].copy()
+    return df_forecast
+
+
+# ============================================================
+# 단일 건물 전체 파이프라인 (병렬 처리 단위)
+# ============================================================
+
+def _simulate_one_building(args: tuple) -> tuple:
+    """단일 건물 시뮬레이션 — ProcessPoolExecutor 작업 단위.
+
+    pybuildingenergy는 항상 8760h 결과를 반환하므로
+    슬림 EPW는 사용하지 않고 8760h EPW를 공유합니다.
+    계산 후 extract_user_period()로 예측 기간만 추출합니다.
+
+    Returns:
+      성공: (name, df_out, infil_eff, v75, persons, occ_ratio)
+      실패: (name, Exception, traceback_str)
+    """
+    (bp, epw_path, epw_year,
+     t_supply_values, t_supply_index,
+     df_open_values, df_open_index, df_open_cols,
+     start_user_str, days, lat, lon) = args
+
+    try:
+        import pandas as pd
+        from energy import (
+            make_restaurant_gains_profile, get_restaurant_hvac_times,
+            build_bui, run_iso52016_simulation, extract_user_period,
+            calc_electricity_year, estimate_persons,
+            compute_effective_infil_ach,
+        )
+        from constants import DHW_FACILITY_PARAMS
+
+        # pandas 객체 재구성 (pickle 우회)
+        t_supply   = pd.Series(t_supply_values,
+                               index=pd.DatetimeIndex(t_supply_index))
+        df_open    = pd.DataFrame(df_open_values,
+                                  index=pd.DatetimeIndex(df_open_index),
+                                  columns=df_open_cols)
+        start_user = pd.Timestamp(start_user_str)
+
+        nm = bp['bldg_name']
+        ut = bp['use_type']
+
+        # 식당 식사 스케줄
+        restaurant_gains_prof = None
+        hvac_start  = bp['hvac_start']
+        hvac_end    = bp['hvac_end']
+        gains_start = bp['gains_start']
+        gains_end   = bp['gains_end']
+        if ut == '식당':
+            restaurant_gains_prof = make_restaurant_gains_profile(
+                bp['meal_bfst'], bp['meal_lunch'], bp['meal_dinner'])
+            hvac_start, hvac_end = get_restaurant_hvac_times(
+                bp['meal_bfst'], bp['meal_lunch'], bp['meal_dinner'])
+            gains_start = min(hvac_start + 1, 23)
+            gains_end   = max(hvac_end - 1, 0)
+
+        # 인원 / 공실 보정
+        area_m2     = bp['area_m2']
+        dhw_persons = bp['dhw_persons']
+        if dhw_persons <= 0:
+            dhw_persons = estimate_persons(area_m2, ut)
+        occ_ratio = min(1.0, dhw_persons / max(1, estimate_persons(area_m2, ut)))
+
+        # 침기 보정
+        infil_eff, v75 = compute_effective_infil_ach(
+            area_m2, bp['floor_h'], bp['infil_base'],
+            bp['oa_m3h'], bp['kitchen_exh'],
+            bp['vent_start'], bp['vent_end'],
+            df_open=df_open, start_user=start_user, days=days,
+        )
+
+        # BUI 생성
+        bui = build_bui(
+            name=f"{nm}_{ut}", lat=lat, lon=lon,
+            area_m2=area_m2, n_floors=bp['floors'],
+            floor_height_m=bp['floor_h'],
+            wwr=bp['wwr'], azimuth_deg=bp['azimuth_deg'],
+            aspect_ratio=bp['aspect_ratio'],
+            roof_u=bp['roof_u'], wall_u=bp['wall_u'],
+            slab_u=bp['slab_u'], win_u=bp['win_u'], win_g=bp['win_g'],
+            heat_set=bp['heat_set'], cool_set=bp['cool_set'],
+            hvac_start=hvac_start, hvac_end=hvac_end,
+            gains_start=gains_start, gains_end=gains_end,
+            internal_gain_heat_wm2=bp['gain_heat'],
+            lighting_wm2=bp['lighting_wm2'],
+            infil_ach=infil_eff,
+            sat_mode=bp['sat_mode'],
+            sun_mode=bp['sun_mode'],
+            occupancy_ratio=occ_ratio,
+            restaurant_gains_prof=restaurant_gains_prof,
+            use_type=ut,
+        )
+
+        # ISO 52016 시뮬레이션 (8760h)
+        hs_year  = run_iso52016_simulation(bui, epw_path, epw_year)
+        sim_year = int(hs_year.index.min().year)
+
+        # 전력 환산 (8760h)
+        fp = DHW_FACILITY_PARAMS.get(bp['dhw_facility'], DHW_FACILITY_PARAMS['없음'])
+        df_year = calc_electricity_year(
+            hs_year,
+            cop_h=bp['cop_h'], cop_c=bp['cop_c'],
+            area_m2=area_m2,
+            lighting_wm2=bp['lighting_wm2'],
+            equip_elec_wm2=bp['equip_elec_wm2'],
+            gains_start=gains_start, gains_end=gains_end,
+            supply_oa_m3h=bp['oa_m3h'],
+            kitchen_exh_m3h=bp['kitchen_exh'],
+            vent_start=bp['vent_start'], vent_end=bp['vent_end'],
+            fan_sp=bp['fan_sp'],
+            t_supply=t_supply,
+            facility_type=bp['dhw_facility'],
+            heater_type=bp['dhw_heater_type'],
+            persons=dhw_persons,
+            shower_lpd=fp['shower_lpd'],
+            shower_t_hot=bp['dhw_t_hot_shower'],
+            kitchen_lpd=fp['kitchen_lpd'],
+            kitchen_t_hot=bp['dhw_t_hot_kitchen'],
+            dhw_cop=bp['dhw_cop'],
+            use_type=ut, occupancy_ratio=occ_ratio,
+            df_open=df_open,
+            sat_mode=bp['sat_mode'],
+            sun_mode=bp['sun_mode'],
+            restaurant_gains_prof=restaurant_gains_prof,
+        )
+
+        # 예측 기간 추출
+        df_out = extract_user_period(df_year, df_open, start_user, days, sim_year)
+        return (nm, df_out, infil_eff, v75, dhw_persons, occ_ratio)
+
+    except Exception as e:
+        import traceback
+        return (bp.get('bldg_name', '?'), e, traceback.format_exc())
+
+
+def run_buildings_parallel(
+    buildings: list,
+    epw_path: str,
+    epw_year: int,
+    t_supply: 'pd.Series',
+    df_open: 'pd.DataFrame',
+    start_user: 'pd.Timestamp',
+    days: int,
+    lat: float,
+    lon: float,
+    max_workers: int = None,
+) -> tuple:
+    """모든 건물을 병렬로 시뮬레이션.
+
+    pybuildingenergy는 항상 8760h를 반환하므로 8760h EPW를 사용합니다.
+    EPW 파일 경로를 각 프로세스에 전달하여 공유합니다.
+    pandas 객체는 values/index로 분해하여 pickle 문제를 우회합니다.
+
+    Returns:
+      results_ok  : {bldg_name: df_out}
+      results_err : {bldg_name: (Exception, traceback_str)}
+      infos       : {bldg_name: {infil_eff, v75, persons, occ_ratio}}
+    """
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    if max_workers is None:
+        max_workers = min(len(buildings), os.cpu_count() or 1)
+
+    # pandas 직렬화 (pickle 우회)
+    t_supply_values = t_supply.values.tolist()
+    t_supply_index  = [str(x) for x in t_supply.index]
+    df_open_values  = df_open.values.tolist()
+    df_open_index   = [str(x) for x in df_open.index]
+    df_open_cols    = list(df_open.columns)
+    start_user_str  = str(start_user)
+
+    args_list = [
+        (bp, epw_path, epw_year,
+         t_supply_values, t_supply_index,
+         df_open_values, df_open_index, df_open_cols,
+         start_user_str, days, lat, lon)
+        for bp in buildings
+    ]
+
+    results_ok  = {}
+    results_err = {}
+    infos       = {}
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_name = {
+            executor.submit(_simulate_one_building, a): a[0]['bldg_name']
+            for a in args_list
+        }
+        for future in as_completed(future_to_name):
+            ret = future.result()
+            nm  = ret[0]
+            if isinstance(ret[1], Exception):
+                results_err[nm] = (ret[1], ret[2] if len(ret) > 2 else '')
+            else:
+                _, df_out, infil_eff, v75, persons, occ_ratio = ret
+                results_ok[nm] = df_out
+                infos[nm] = {
+                    'infil_eff': infil_eff,
+                    'v75':       v75,
+                    'persons':   persons,
+                    'occ_ratio': occ_ratio,
+                }
+
+    return results_ok, results_err, infos
