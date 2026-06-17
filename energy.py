@@ -45,6 +45,18 @@ from constants import (
     get_iso18523_schedule,
 )
 
+# Non-operating days still have small standby loads such as emergency lighting,
+# network equipment, refrigerators, chargers, and plugged-in devices.
+# Set these to 0.0 to restore the previous behavior.
+OFFDAY_LIGHTING_STANDBY_RATIO = 0.05
+OFFDAY_EQUIP_STANDBY_RATIO = 0.05
+
+# pybuildingenergy treats these sentinel setpoints as "system not installed/off".
+# This matches temporary buildings where HVAC units are switched off at commute time
+# instead of maintaining a night/weekend setback temperature.
+HVAC_OFF_HEATING_SETPOINT = -999.0
+HVAC_OFF_COOLING_SETPOINT = 999.0
+
 # ============================================================
 # BUI 빌더
 # ============================================================
@@ -63,13 +75,10 @@ def _weekend_mode_to_profile(mode: str, weekday_prof: list) -> list:
     """주말 운영 모드를 24h 0/1 프로파일로 변환.
 
     '없음(OFF)'       → 전부 0 (free-float)
-    '오전 운영(06~13h)' → 06~13h = 1, 나머지 0
     '평일 동일'        → weekday_prof 그대로 복사
     """
     if mode == '평일 동일':
         return list(weekday_prof)
-    elif mode == '오전 운영(06~13h)':
-        return make_onoff_profile(6, 13, on=1, off=0)
     else:  # '없음(OFF)'
         return [0] * 24
 
@@ -78,10 +87,6 @@ def _weekend_mode_to_occ(mode: str, weekday_occ: list) -> list:
     """주말 운영 모드를 내부발열 비율 프로파일로 변환."""
     if mode == '평일 동일':
         return list(weekday_occ)
-    elif mode == '오전 운영(06~13h)':
-        # 오전 운영 시 오전 피크 비율은 평일의 70% 수준
-        am_val = max(weekday_occ[8:14]) * 0.7 if any(weekday_occ[8:14]) else 0.5
-        return make_onoff_profile(6, 13, on=am_val, off=0.0)
     else:
         return [0.0] * 24
 
@@ -148,9 +153,11 @@ def build_bui(
     area_m2: float, n_floors: int, floor_height_m: float,
     wwr: float, azimuth_deg: float, aspect_ratio: float,
     roof_u: float, wall_u: float, slab_u: float,
+    door_u: float, door_area_m2: float,
     win_u: float, win_g: float,
     heat_set: float, cool_set: float,
     hvac_start: int, hvac_end: int,
+    heating_capacity_kw: float, cooling_capacity_kw: float,
     gains_start: int, gains_end: int,
     internal_gain_heat_wm2: float, lighting_wm2: float,
     infil_ach: float,
@@ -163,9 +170,9 @@ def build_bui(
 
     building_type_class='Office' 고정 (라이브러리 제약).
 
-    sat_mode / sun_mode: 토·일 각각 '없음(OFF)' / '오전 운영(06~13h)' / '평일 동일'
-      → 두 모드를 평균한 weekend 프로파일을 BUI에 입력
-      (pybuildingenergy는 weekday/weekend 두 종류만 지원)
+    sat_mode / sun_mode: '없음(OFF)' / '평일 동일'
+      → pybuildingenergy는 weekday/weekend 두 종류만 지원하므로
+        앱에서는 토·일을 같은 주말 조건으로 전달한다.
     restaurant_gains_prof: 식당 식사 선택 기반 24h 커스텀 발열 프로파일 (None이면 표준 on/off)
     """
     n_floors = max(1, int(n_floors))
@@ -180,6 +187,8 @@ def build_bui(
 
     wall_gross = {'S': L*H, 'N': L*H, 'E': W*H, 'W': W*H}
     wwr = max(0.0, min(0.95, float(wwr)))
+    heating_capacity_w = max(0.0, float(heating_capacity_kw)) * 1000.0
+    cooling_capacity_w = max(0.0, float(cooling_capacity_kw)) * 1000.0
 
     base_az = {'S': 180.0, 'N': 0.0, 'E': 90.0, 'W': 270.0}
     def raz(face):
@@ -216,14 +225,28 @@ def build_bui(
     ]
 
     walls = []
+    door_area = max(0.0, float(door_area_m2))
+    door_added = False
     for face in ['S','N','E','W']:
         g  = wall_gross[face]
         az = raz(face)
+        opaque_area = float(g * (1 - wwr))
+        door_on_face = 0.0
+        if face == 'S' and door_area > 0:
+            door_on_face = min(door_area, opaque_area)
+            opaque_area -= door_on_face
+            door_added = door_on_face > 0
         walls.append({"name":f"Wall_{face}","type":"opaque",
-                      "area":float(g*(1-wwr)),"u_value":float(wall_u),
+                      "area":opaque_area,"u_value":float(wall_u),
                       "solar_absorptance":0.5,"thermal_capacity":80000,
                       "orientation":{"azimuth":az,"tilt":90},
                       "sky_view_factor":0.5,"name_adj_zone":None})
+        if door_on_face > 0:
+            walls.append({"name":"Door_S","type":"opaque",
+                          "area":float(door_on_face),"u_value":float(door_u),
+                          "solar_absorptance":0.5,"thermal_capacity":20000,
+                          "orientation":{"azimuth":az,"tilt":90},
+                          "sky_view_factor":0.5,"name_adj_zone":None})
         walls.append({"name":f"Win_{face}","type":"transparent",
                       "area":float(g*wwr),"u_value":float(win_u),
                       "g_value":float(win_g),
@@ -255,14 +278,13 @@ def build_bui(
         "building_parameters":{
             "temperature_setpoints":{
                 "heating_setpoint":float(heat_set),
-                "heating_setback":float(heat_set)-3.0,
+                "heating_setback":HVAC_OFF_HEATING_SETPOINT,
                 "cooling_setpoint":float(cool_set),
-                "cooling_setback":float(cool_set)+4.0,
+                "cooling_setback":HVAC_OFF_COOLING_SETPOINT,
             },
             "system_capacities":{
-                # ISO 52016: 에너지 소요량 계산 — 설비 용량 무제한(1e6 W)
-                # 항상 설정온도 유지 가정. 실제 설비 용량은 결과에서 별도 확인.
-                "heating_capacity":1e6,"cooling_capacity":1e6,
+                "heating_capacity":heating_capacity_w,
+                "cooling_capacity":cooling_capacity_w,
             },
             "internal_gains":gains,
             "airflow_rates":{"infiltration_rate":float(infil_ach)},
@@ -361,6 +383,51 @@ def get_load_schedule(use_type: str, load_type: str, hour: int,
     return get_iso18523_schedule(use_type, load_type, hour)
 
 
+_NONRES_WASH_PROF = [
+    0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+    0.02, 0.05, 0.10, 0.10, 0.08, 0.08,
+    0.10, 0.08, 0.08, 0.08, 0.08, 0.10,
+    0.05, 0.00, 0.00, 0.00, 0.00, 0.00,
+]
+
+
+def _normalize_profile(prof: list) -> list:
+    s = float(sum(prof))
+    return [float(v) / s for v in prof] if s > 0 else [0.0] * 24
+
+
+def _dhw_operation_scale(ts, use_type: str, sat_mode: str, sun_mode: str) -> float:
+    if use_type == '숙소':
+        return 1.0
+    dow = ts.dayofweek
+    if dow == 5:
+        mode = sat_mode
+    elif dow == 6:
+        mode = sun_mode
+    else:
+        return 1.0
+    if mode == '평일 동일':
+        return 1.0
+    return 0.0
+
+
+def _dhw_profiles(use_type: str, restaurant_gains_prof: Optional[list] = None):
+    shower_prof = _SH_PROF if use_type == '숙소' else _normalize_profile(_NONRES_WASH_PROF)
+    if use_type == '식당' and restaurant_gains_prof is not None:
+        kitchen_prof = _normalize_profile(restaurant_gains_prof)
+    else:
+        kitchen_prof = _KT_PROF
+    return shower_prof, kitchen_prof
+
+
+def _limit_dhw_heat_by_capacity(q_heat_kwh: float, capacity_kw: float, is_electric: bool, cop: float) -> float:
+    if capacity_kw <= 0:
+        return float(q_heat_kwh)
+    if is_electric and cop > 0:
+        return min(float(q_heat_kwh), float(capacity_kw) * float(cop))
+    return min(float(q_heat_kwh), float(capacity_kw))
+
+
 def calc_dhw_elec_series(
     index: pd.DatetimeIndex,
     t_supply: pd.Series,
@@ -370,6 +437,11 @@ def calc_dhw_elec_series(
     shower_lpd: float, shower_t_hot: float,
     kitchen_lpd: float, kitchen_t_hot: float,
     dhw_cop: float,
+    dhw_capacity_kw: float = 0.0,
+    use_type: str = '사무실',
+    sat_mode: str = '없음(OFF)',
+    sun_mode: str = '없음(OFF)',
+    restaurant_gains_prof: Optional[list] = None,
 ) -> Tuple[pd.Series, pd.Series]:
     """온수 전기소비[kWh] + 열량[kWh_열] 시간 시계열.
 
@@ -384,6 +456,7 @@ def calc_dhw_elec_series(
         return z, z
 
     t_arr = t_supply.reindex(index, method='nearest').fillna(15.0).values
+    shower_prof, kitchen_prof = _dhw_profiles(use_type, restaurant_gains_prof)
     elec, heat = [], []
     for i, ts in enumerate(index):
         t_s = float(t_arr[i])
@@ -403,11 +476,15 @@ def calc_dhw_elec_series(
         q_kt = 0.0
         if shower_lpd > 0:
             dt = max(0.0, float(shower_t_hot) - t_s)
-            q_sh = float(persons)*float(shower_lpd)*1.163*dt * _SH_PROF[ts.hour]
+            q_sh = float(persons)*float(shower_lpd)*1.163*dt * shower_prof[ts.hour]
         if kitchen_lpd > 0:
             dt = max(0.0, float(kitchen_t_hot) - t_s)
-            q_kt = float(persons)*float(kitchen_lpd)*1.163*dt * _KT_PROF[ts.hour]
+            q_kt = float(persons)*float(kitchen_lpd)*1.163*dt * kitchen_prof[ts.hour]
         q_total_kwh = (q_sh + q_kt) / 1000.0
+        q_total_kwh *= _dhw_operation_scale(ts, use_type, sat_mode, sun_mode)
+        q_total_kwh = _limit_dhw_heat_by_capacity(
+            q_total_kwh, float(dhw_capacity_kw), bool(is_elec), float(dhw_cop)
+        )
 
         if is_elec and dhw_cop > 0:
             elec.append(q_total_kwh / float(dhw_cop))
@@ -433,6 +510,7 @@ def calc_electricity_year(
     shower_lpd: float, shower_t_hot: float,
     kitchen_lpd: float, kitchen_t_hot: float,
     dhw_cop: float,
+    dhw_capacity_kw: float = 0.0,
     use_type: str = '사무실',
     occupancy_ratio: float = 1.0,
     df_open: Optional[pd.DataFrame] = None,
@@ -470,10 +548,22 @@ def calc_electricity_year(
     if use_type == '숙소' and 0.0 < float(occupancy_ratio) < 1.0:
         beta = DORM_HVAC_BASE_RATIO
         hvac_raw = hvac_raw * (beta + (1 - beta) * float(occupancy_ratio))
+
+    # pybuildingenergy의 calendar/weekend 해석 차이로 주말 미운영일에
+    # Q_H/Q_C가 남는 경우가 있어, 앱의 주말 운영 설정을 최종 전력에 한 번 더 반영한다.
+    hvac_scale = []
+    for ts in out.index:
+        if ts.dayofweek == 5:
+            hvac_scale.append(1.0 if sat_mode == '평일 동일' else 0.0)
+        elif ts.dayofweek == 6:
+            hvac_scale.append(1.0 if sun_mode == '평일 동일' else 0.0)
+        else:
+            hvac_scale.append(1.0)
+    hvac_raw = hvac_raw * pd.Series(hvac_scale, index=out.index)
     out['HVAC_Elec_kWh'] = hvac_raw
 
     # ── 조명·콘센트 — 요일별 + ISO 18523 / 식당 식사 프로파일 ────
-    def _day_scale(ts) -> float:
+    def _operation_scale(ts) -> float:
         """요일별 운영 계수: 평일=1.0, 토·일은 mode에 따라 결정."""
         dow = ts.dayofweek  # 0=월 … 4=금, 5=토, 6=일
         if dow == 5:
@@ -484,31 +574,47 @@ def calc_electricity_year(
             return 1.0
         if mode == '평일 동일':
             return 1.0
-        elif mode == '오전 운영(06~13h)':
-            return 1.0 if 6 <= ts.hour <= 13 else 0.0
         else:  # '없음(OFF)'
             return 0.0
 
+    def _electric_load_ratio(ts, scheduled_ratio: float, standby_ratio: float) -> float:
+        op_scale = _operation_scale(ts)
+        if op_scale > 0.0:
+            return float(scheduled_ratio) * op_scale
+        return float(standby_ratio)
+
     if restaurant_gains_prof is not None:
         out['Lighting_Elec_kWh'] = [
-            restaurant_gains_prof[ts.hour] * _day_scale(ts)
+            _electric_load_ratio(
+                ts, restaurant_gains_prof[ts.hour], OFFDAY_LIGHTING_STANDBY_RATIO
+            )
             * float(lighting_wm2) * float(area_m2) / 1000.0
             for ts in out.index
         ]
         out['Equip_Elec_kWh'] = [
-            restaurant_gains_prof[ts.hour] * _day_scale(ts)
+            _electric_load_ratio(
+                ts, restaurant_gains_prof[ts.hour], OFFDAY_EQUIP_STANDBY_RATIO
+            )
             * float(equip_elec_wm2) * float(area_m2) / 1000.0
             for ts in out.index
         ]
     else:
         out['Lighting_Elec_kWh'] = [
-            get_load_schedule(use_type, '조명', int(ts.hour), gains_start, gains_end)
-            * _day_scale(ts) * float(lighting_wm2) * float(area_m2) / 1000.0
+            _electric_load_ratio(
+                ts,
+                get_load_schedule(use_type, '조명', int(ts.hour), gains_start, gains_end),
+                OFFDAY_LIGHTING_STANDBY_RATIO,
+            )
+            * float(lighting_wm2) * float(area_m2) / 1000.0
             for ts in out.index
         ]
         out['Equip_Elec_kWh'] = [
-            get_load_schedule(use_type, '콘센트', int(ts.hour), gains_start, gains_end)
-            * _day_scale(ts) * float(equip_elec_wm2) * float(area_m2) / 1000.0
+            _electric_load_ratio(
+                ts,
+                get_load_schedule(use_type, '콘센트', int(ts.hour), gains_start, gains_end),
+                OFFDAY_EQUIP_STANDBY_RATIO,
+            )
+            * float(equip_elec_wm2) * float(area_m2) / 1000.0
             for ts in out.index
         ]
 
@@ -526,6 +632,7 @@ def calc_electricity_year(
     if is_hp_dhw and df_open is not None:
         t_out_yr = df_open['temperature_2m'].reindex(
             out.index, method='nearest').fillna(10.0)
+        shower_prof, kitchen_prof = _dhw_profiles(use_type, restaurant_gains_prof)
         dhw_e_list, dhw_h_list = [], []
         for i, ts in enumerate(out.index):
             t_o   = float(t_out_yr.iloc[i])
@@ -534,13 +641,17 @@ def calc_electricity_year(
             q_kt  = 0.0
             if shower_lpd > 0:
                 dt = max(0.0, float(shower_t_hot) - t_s)
-                q_sh = float(persons) * float(shower_lpd) * 1.163 * dt * _SH_PROF[ts.hour]
+                q_sh = float(persons) * float(shower_lpd) * 1.163 * dt * shower_prof[ts.hour]
             if kitchen_lpd > 0:
                 dt = max(0.0, float(kitchen_t_hot) - t_s)
-                q_kt = float(persons) * float(kitchen_lpd) * 1.163 * dt * _KT_PROF[ts.hour]
+                q_kt = float(persons) * float(kitchen_lpd) * 1.163 * dt * kitchen_prof[ts.hour]
             q_kwh = (q_sh + q_kt) / 1000.0
+            q_kwh *= _dhw_operation_scale(ts, use_type, sat_mode, sun_mode)
             cop_t = hp_cop_dhw(dhw_cop, t_o)
             hd = DHW_HEATER_DEFAULTS.get(heater_type, DHW_HEATER_DEFAULTS['없음'])
+            q_kwh = _limit_dhw_heat_by_capacity(
+                q_kwh, float(dhw_capacity_kw), bool(hd['is_electric']), float(cop_t)
+            )
             if hd['is_electric'] and cop_t > 0:
                 dhw_e_list.append(q_kwh / cop_t)
             else:
@@ -552,6 +663,8 @@ def calc_electricity_year(
         dhw_e, dhw_h = calc_dhw_elec_series(
             out.index, t_supply, facility_type, heater_type,
             persons, shower_lpd, shower_t_hot, kitchen_lpd, kitchen_t_hot, dhw_cop,
+            dhw_capacity_kw,
+            use_type, sat_mode, sun_mode, restaurant_gains_prof,
         )
         out['DHW_Elec_kWh'] = dhw_e.values
         out['DHW_Heat_kWh'] = dhw_h.values
@@ -610,6 +723,20 @@ def weight_from_weather(t28,g28,t29,g29,t01,g01,ag=0.01):
     return max(0., min(1., 1.-d28/(d28+d01+1e-6)))
 
 
+def _weekday_matched_replace_year(ts: pd.Timestamp, year: int) -> Optional[pd.Timestamp]:
+    """Map a real timestamp to the simulation year while preserving weekday."""
+    try:
+        base = pd.Timestamp(ts).replace(year=year)
+    except ValueError:
+        return None
+    target_dow = pd.Timestamp(ts).dayofweek
+    candidates = [base + pd.Timedelta(days=d) for d in range(-3, 4)]
+    candidates = [c for c in candidates if c.year == year and c.dayofweek == target_dow]
+    if not candidates:
+        return base
+    return min(candidates, key=lambda c: abs((c - base).days))
+
+
 def extract_user_period(df_year, df_open, start_user, days, sim_year):
     """사용자 기간에 해당하는 시뮬레이션 결과를 추출.
 
@@ -634,8 +761,10 @@ def extract_user_period(df_year, df_open, start_user, days, sim_year):
             w = weight_from_weather(t28, g28, t29, g29, t01, g01)
             rows.append(v28 * w + v01 * (1.0 - w))
         else:
-            # 연도 경계를 넘어도 sim_year의 동일 월·일로 매핑
-            ts_sim = ts.replace(year=sim_year)
+            # pybuildingenergy uses a fixed simulation-year calendar.
+            # Preserve the requested weekday so weekend/weekday schedules
+            # match the user's actual dates.
+            ts_sim = _weekday_matched_replace_year(ts, sim_year)
             rows.append(df_year.loc[ts_sim])
     return pd.DataFrame(rows, index=user_index)
 
@@ -696,5 +825,3 @@ def _iv(v, fb=0):
         return int(float(str(v) or fb))
     except Exception:
         return int(fb)
-
-

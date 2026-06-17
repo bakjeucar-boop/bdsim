@@ -22,8 +22,26 @@ import requests
 from constants import WATER_SOURCE_PARAMS, SUPPLY_TEMP_MIN
 
 OPEN_METEO_URL = 'https://api.open-meteo.com/v1/forecast'
+OPEN_METEO_ARCHIVE_URL = 'https://archive-api.open-meteo.com/v1/archive'
+OPEN_METEO_FORECAST_DAYS_MAX = 16
 
-OPEN_METEO_URL = 'https://api.open-meteo.com/v1/forecast'
+OPEN_METEO_HOURLY_VARS = [
+    'temperature_2m', 'dew_point_2m', 'relative_humidity_2m',
+    'surface_pressure', 'wind_speed_10m', 'wind_direction_10m',
+    'cloud_cover', 'shortwave_radiation', 'direct_normal_irradiance',
+    'diffuse_radiation', 'precipitation',
+    'soil_temperature_54cm',
+]
+
+
+def _local_naive_datetime_index(values) -> pd.DatetimeIndex:
+    """Return local wall-clock timestamps without timezone metadata."""
+    idx = pd.to_datetime(values)
+    if isinstance(idx, pd.Series):
+        idx = pd.DatetimeIndex(idx)
+    if getattr(idx, 'tz', None) is not None:
+        idx = idx.tz_localize(None)
+    return pd.DatetimeIndex(idx)
 
 
 def fetch_open_meteo_hourly_forecast(
@@ -32,30 +50,46 @@ def fetch_open_meteo_hourly_forecast(
     past_days: int = 92,
     forecast_days: int = 16,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-
-    hourly_vars = [
-        'temperature_2m', 'dew_point_2m', 'relative_humidity_2m',
-        'surface_pressure', 'wind_speed_10m', 'wind_direction_10m',
-        'cloud_cover', 'shortwave_radiation', 'direct_normal_irradiance',
-        'diffuse_radiation', 'precipitation',
-        'soil_temperature_54cm',   # ~54cm 토양온도 — 지중매설 급수온도 계산용
-        # depth_factor 보정으로 ~30cm(×1.2)·1m+(×0.7) 두 깊이 모두 근사
-        # /v1/forecast API 깊이 포인트 방식: 0/6/18/54cm
-    ]
     params = {
         'latitude': lat, 'longitude': lon,
-        'hourly': ','.join(hourly_vars),
+        'hourly': ','.join(OPEN_METEO_HOURLY_VARS),
         'timeformat': 'iso8601', 'timezone': tz,
         'wind_speed_unit': 'ms',
         'past_days': max(0, min(92, int(past_days))),
         'forecast_days': max(0, min(16, int(forecast_days))),
     }
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=60)
+    return _fetch_open_meteo(OPEN_METEO_URL, params, lat, lon, tz)
+
+
+def fetch_open_meteo_hourly_archive(
+    lat: float, lon: float,
+    start_date: str,
+    end_date: str,
+    tz: str = 'auto',
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    params = {
+        'latitude': lat, 'longitude': lon,
+        'hourly': ','.join(OPEN_METEO_HOURLY_VARS),
+        'timeformat': 'iso8601', 'timezone': tz,
+        'wind_speed_unit': 'ms',
+        'start_date': start_date,
+        'end_date': end_date,
+    }
+    return _fetch_open_meteo(OPEN_METEO_ARCHIVE_URL, params, lat, lon, tz)
+
+
+def _fetch_open_meteo(
+    url: str, params: Dict[str, Any], lat: float, lon: float, tz: str
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    r = requests.get(url, params=params, timeout=60)
     r.raise_for_status()
     data = r.json()
     h = data['hourly']
-    df = pd.DataFrame({k: h.get(k, [None]*len(h['time'])) for k in hourly_vars})
-    df.index = pd.to_datetime(h['time'])
+    df = pd.DataFrame({
+        k: h.get(k, [None] * len(h['time']))
+        for k in OPEN_METEO_HOURLY_VARS
+    })
+    df.index = _local_naive_datetime_index(h['time'])
     df.index.name = 'datetime'
     meta = {
         'latitude': data.get('latitude', lat),
@@ -66,6 +100,90 @@ def fetch_open_meteo_hourly_forecast(
         'timezone_abbreviation': data.get('timezone_abbreviation', ''),
     }
     return df, meta
+
+
+def fetch_open_meteo_weather_for_period(
+    lat: float, lon: float,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    tz: str = 'auto',
+    today: Optional[pd.Timestamp] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Fetch [start, end) weather with archive for past and forecast for today/future."""
+    start = pd.Timestamp(start)
+    end = pd.Timestamp(end)
+    if start.tzinfo is not None:
+        start = start.tz_localize(None)
+    if end.tzinfo is not None:
+        end = end.tz_localize(None)
+    if end <= start:
+        raise ValueError('기상 조회 종료시각은 시작시각보다 뒤여야 합니다.')
+
+    today0 = (
+        pd.Timestamp(today).normalize()
+        if today is not None else pd.Timestamp.now().normalize()
+    )
+    forecast_end_exclusive = today0 + pd.Timedelta(days=OPEN_METEO_FORECAST_DAYS_MAX)
+    if end > forecast_end_exclusive:
+        max_last_day = (forecast_end_exclusive - pd.Timedelta(hours=1)).date()
+        raise ValueError(
+            f"미래 예측은 오늘부터 {OPEN_METEO_FORECAST_DAYS_MAX}일까지만 지원됩니다. "
+            f"지원 가능한 마지막 날짜는 {max_last_day}입니다."
+        )
+
+    parts: List[pd.DataFrame] = []
+    metas: List[Dict[str, Any]] = []
+
+    def _last_inclusive_date(exclusive_end: pd.Timestamp):
+        return (exclusive_end - pd.Timedelta(hours=1)).date()
+
+    if start < today0:
+        archive_end = min(end, today0)
+        if archive_end > start:
+            df_hist, meta_hist = fetch_open_meteo_hourly_archive(
+                lat, lon,
+                str(start.date()),
+                str(_last_inclusive_date(archive_end)),
+                tz=tz,
+            )
+            hist_part = df_hist[(df_hist.index >= start) & (df_hist.index < archive_end)]
+            if not hist_part.empty:
+                parts.append(hist_part)
+            metas.append(meta_hist)
+
+    if end > today0:
+        forecast_start = max(start, today0)
+        if end > forecast_start:
+            last_date = _last_inclusive_date(end)
+            forecast_days = (pd.Timestamp(last_date) - today0).days + 1
+            df_fcst, meta_fcst = fetch_open_meteo_hourly_forecast(
+                lat, lon, tz=tz, past_days=0, forecast_days=forecast_days,
+            )
+            fcst_part = df_fcst[(df_fcst.index >= forecast_start) & (df_fcst.index < end)]
+            if not fcst_part.empty:
+                parts.append(fcst_part)
+            metas.append(meta_fcst)
+
+    if not parts:
+        raise ValueError('요청 기간에 해당하는 기상 데이터가 없습니다.')
+
+    df = pd.concat(parts).sort_index()
+    df = df.loc[~df.index.duplicated(keep='last')]
+    expected = pd.date_range(start=start, end=end, freq='h', inclusive='left')
+    missing = expected.difference(df.index)
+    if len(missing) > 0:
+        raise ValueError(f'기상 데이터에 누락 시간이 있습니다: {missing[0]}')
+
+    meta = dict(metas[-1])
+    if len(metas) > 1:
+        meta['source'] = 'archive+forecast'
+    elif end <= today0:
+        meta['source'] = 'archive'
+    else:
+        meta['source'] = 'forecast'
+    meta['weather_start'] = str(start)
+    meta['weather_end'] = str(end)
+    return df.reindex(expected), meta
 
 
 # ============================================================
@@ -88,6 +206,19 @@ def _safe_replace_year(ts: pd.Timestamp, year: int) -> Optional[pd.Timestamp]:
         return None
 
 
+def _weekday_matched_replace_year(ts: pd.Timestamp, year: int) -> Optional[pd.Timestamp]:
+    """Map a real timestamp to the simulation year while preserving weekday."""
+    base = _safe_replace_year(ts, year)
+    if base is None:
+        return None
+    target_dow = pd.Timestamp(ts).dayofweek
+    candidates = [base + pd.Timedelta(days=d) for d in range(-3, 4)]
+    candidates = [c for c in candidates if c.year == year and c.dayofweek == target_dow]
+    if not candidates:
+        return base
+    return min(candidates, key=lambda c: abs((c - base).days))
+
+
 def build_epw_year_dataframe(
     df: pd.DataFrame, meta: Dict[str, Any], epw_year: int
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -96,7 +227,7 @@ def build_epw_year_dataframe(
     for c in df.columns:
         base[c] = float('nan')
 
-    mapped = [_safe_replace_year(ts, epw_year) for ts in df.index]
+    mapped = [_weekday_matched_replace_year(ts, epw_year) for ts in df.index]
     dfm = df.copy()
     dfm.index = mapped
     dfm = dfm[~dfm.index.isna()].loc[~dfm.index.duplicated(keep='last')]
@@ -116,10 +247,25 @@ def build_epw_year_dataframe(
 
 
 def write_epw_8760_from_open_meteo(
-    base: pd.DataFrame, meta: Dict[str, Any], out_path: str
+    base: pd.DataFrame, meta: Dict[str, Any], out_path: str,
+    compensate_pybui_tz_roll: bool = False,
 ) -> None:
     tz_h = float(meta.get('utc_offset_seconds', 0)) / 3600.0
     elev = _to_float(meta.get('elevation', 0.0), 0.0)
+    epw_base = base
+    if compensate_pybui_tz_roll and len(base) > 0:
+        # pybuildingenergy rolls every EPW weather column by int(TZ).
+        # Open-Meteo already returns local clock-hour data, so pre-shift
+        # the EPW rows in the opposite direction to keep HVAC schedules
+        # aligned with local time after the engine import step.
+        tz_roll = int(tz_h)
+        if tz_roll != 0:
+            n = len(base)
+            offset = tz_roll % n
+            values = pd.concat([base.iloc[offset:], base.iloc[:offset]], axis=0)
+            epw_base = values.copy()
+            epw_base.index = base.index
+    first_day_name = pd.Timestamp(epw_base.index[0]).day_name()
     header = [
         f"LOCATION,Forecast,-,-,Open-Meteo,0,"
         f"{meta.get('latitude',0)},{meta.get('longitude',0)},{tz_h},{elev}",
@@ -127,10 +273,10 @@ def write_epw_8760_from_open_meteo(
         'GROUND TEMPERATURES,0','HOLIDAYS/DAYLIGHT SAVING,No,0,0,0',
         'COMMENTS 1,Generated from Open-Meteo hourly forecast (8760h)',
         f"COMMENTS 2,Timezone={meta.get('timezone','')}",
-        'DATA PERIODS,1,1,Data,Sunday,1/1,12/31',
+        f'DATA PERIODS,1,1,Data,{first_day_name},1/1,12/31',
     ]
     rows = []
-    for ts, r in base.iterrows():
+    for ts, r in epw_base.iterrows():
         hr = int(ts.hour) + 1
         dry = _to_float(r.get('temperature_2m'), 99.9)
         dew = _to_float(r.get('dew_point_2m'), 99.9)
@@ -225,4 +371,3 @@ def calc_supply_temp_series(
                     f"({water_source}) — 보온·히팅케이블 조치 필요")
 
     return t_supply, warnings
-

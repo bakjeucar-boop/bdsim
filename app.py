@@ -5,6 +5,8 @@
 import io
 import os
 import tempfile
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import openpyxl
@@ -16,7 +18,6 @@ import streamlit as st
 # 내부 모듈 임포트
 from constants import (
     DHW_FACILITY_PARAMS,
-    DHW_FACILITY_TYPES,
     DHW_HEATER_DEFAULTS,
     DHW_HEATER_TYPES,
     ISO18523_PROFILE,
@@ -39,12 +40,89 @@ from energy import (
     run_iso52016_simulation,
 )
 from weather import (
+    OPEN_METEO_FORECAST_DAYS_MAX,
     _safe_replace_year,
     build_epw_year_dataframe,
     calc_supply_temp_series,
-    fetch_open_meteo_hourly_forecast,
+    fetch_open_meteo_weather_for_period,
     write_epw_8760_from_open_meteo,
 )
+
+
+# --- 자동 결과 파일 저장 설정 ---
+# 나중에 이 기능을 제거하려면 아래 값을 False로 바꾸거나
+# save_result_files_to_outputs() 호출부만 삭제하면 됩니다.
+AUTO_SAVE_RESULT_FILES = False
+AUTO_SAVE_OUTPUT_DIR = (
+    Path(__file__).resolve().parents[2] / "outputs"
+    if (Path(__file__).resolve().parents[2] / "outputs").exists()
+    else Path(__file__).resolve().parent / "outputs"
+)
+AUTO_SAVE_EXCEL_NAME = "forecast_energy_results.xlsx"
+AUTO_SAVE_CSV_NAME = "forecast_site_hourly.csv"
+AUTO_SAVE_UNIQUE_FILES = True
+
+# Extra pre-simulation period used only to settle building thermal state.
+# Increase for heavy buildings; set to 0 to disable.
+SIMULATION_SPINUP_DAYS = 7
+WEATHER_PRELOAD_DAYS = 2
+OPEN_METEO_ARCHIVE_MIN_DATE = pd.Timestamp("1940-01-01").date()
+MAX_SIMULATION_DAYS = 366
+DEFAULT_WALL_U = 0.424
+DEFAULT_SLAB_U = 0.410
+DEFAULT_ROOF_U = 0.428
+DEFAULT_DOOR_U = 1.500
+DEFAULT_DOOR_AREA_M2 = 6.0
+DEFAULT_DOOR_AREA_RATIO_PCT = 0.75
+DEFAULT_WINDOW_U = 2.100
+DEFAULT_WINDOW_G = 0.583
+DEFAULT_COOLING_CAPACITY_KW = 162.4
+DEFAULT_COOLING_COP = 3.5
+DEFAULT_HEATING_CAPACITY_KW = 182.8
+DEFAULT_HEATING_COP = 4.12
+DEFAULT_OFFICE_PERSONS = 35
+DEFAULT_DHW_BOILER_CAPACITY_KW = 5.9
+
+
+def default_persons_for_use(area_m2: float, use_type: str) -> int:
+    if use_type == "사무실":
+        return max(1, int(round(float(area_m2) * DEFAULT_OFFICE_PERSONS / 800.0)))
+    if use_type == "식당":
+        return default_restaurant_meals(area_m2)
+    return estimate_persons(area_m2, use_type)
+
+
+def default_restaurant_meals(area_m2: float) -> int:
+    """식당의 1일 급식 인원 기본값.
+
+    실제 식수 인원이 있으면 사용자가 직접 바꾸는 것이 가장 정확합니다.
+    """
+    return max(1, int(round(float(area_m2) * 1.0)))
+
+
+def estimate_kitchen_exhaust_m3h(area_m2: float, meals_per_day: int) -> float:
+    """식당 면적과 1일 급식 인원 기반 주방 후드 배기량의 보수적 기본값."""
+    estimate = 2.0 * float(area_m2) + 5.0 * float(meals_per_day)
+    estimate = max(500.0, min(5000.0, estimate))
+    return round(estimate / 10.0) * 10.0
+
+
+def normalize_dhw_heater_type(value: str) -> str:
+    return {
+        "전기저항식(저장)": "전기보일러",
+        "전기저항식(순간)": "전기보일러",
+        "히트펌프": "전기보일러",
+        "가스온수기": "가스보일러",
+    }.get(value, value if value in DHW_HEATER_TYPES else "전기보일러")
+
+
+def choose_simulation_year(start_user: pd.Timestamp, end_user: pd.Timestamp) -> int:
+    """Choose an EPW simulation year that minimizes calendar remapping artifacts."""
+    start = pd.Timestamp(start_user)
+    last = pd.Timestamp(end_user) - pd.Timedelta(hours=1)
+    if start.year == last.year and not pd.Timestamp(start.year, 12, 31).is_leap_year:
+        return int(start.year)
+    return 2009
 
 # --- 0. Streamlit 설정 및 최적화 ---
 st.set_page_config(
@@ -57,8 +135,41 @@ st.set_page_config(
 
 # Open-Meteo API 호출 캐싱 (UI 재실행 시 중복 요청 방지)
 @st.cache_data(ttl=3600)
-def cached_fetch_weather(lat: float, lon: float):
-    return fetch_open_meteo_hourly_forecast(lat, lon)
+def cached_fetch_weather(lat: float, lon: float, start_iso: str, end_iso: str):
+    return fetch_open_meteo_weather_for_period(
+        lat, lon, pd.Timestamp(start_iso), pd.Timestamp(end_iso)
+    )
+
+
+def save_result_files_to_outputs(excel_buf: io.BytesIO, csv_bytes: bytes) -> Dict[str, Path]:
+    """Save result files for environments where browser downloads are unclear."""
+    AUTO_SAVE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if AUTO_SAVE_UNIQUE_FILES:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        excel_path = AUTO_SAVE_OUTPUT_DIR / f"forecast_energy_results_{stamp}.xlsx"
+        csv_path = AUTO_SAVE_OUTPUT_DIR / f"forecast_site_hourly_{stamp}.csv"
+    else:
+        excel_path = AUTO_SAVE_OUTPUT_DIR / AUTO_SAVE_EXCEL_NAME
+        csv_path = AUTO_SAVE_OUTPUT_DIR / AUTO_SAVE_CSV_NAME
+
+    excel_path.write_bytes(excel_buf.getvalue())
+    csv_path.write_bytes(csv_bytes)
+
+    latest_paths = {}
+    for latest_path, source_bytes in [
+        (AUTO_SAVE_OUTPUT_DIR / AUTO_SAVE_EXCEL_NAME, excel_buf.getvalue()),
+        (AUTO_SAVE_OUTPUT_DIR / AUTO_SAVE_CSV_NAME, csv_bytes),
+    ]:
+        if latest_path in (excel_path, csv_path):
+            continue
+        try:
+            latest_path.write_bytes(source_bytes)
+            latest_paths[latest_path.suffix.lower()] = latest_path
+        except PermissionError:
+            pass
+
+    return {"excel": excel_path, "csv": csv_path, **latest_paths}
 
 
 # --- 1. 세션 상태 (Session State) 초기화 ---
@@ -216,19 +327,44 @@ with st.sidebar:
         "경도", value=126.9780, format="%.6f", help="현장의 경도"
     )
 
+    today = pd.Timestamp.now().normalize().date()
+    min_select_date = (
+        pd.Timestamp(OPEN_METEO_ARCHIVE_MIN_DATE)
+        + pd.Timedelta(days=SIMULATION_SPINUP_DAYS + WEATHER_PRELOAD_DAYS)
+    ).date()
+    max_select_date = (
+        pd.Timestamp(today) + pd.Timedelta(days=OPEN_METEO_FORECAST_DAYS_MAX - 1)
+    ).date()
+
+    default_start = min(max(today, min_select_date), max_select_date)
     site_start = st.date_input(
-        "예측 시작일", value=pd.Timestamp.now().date()
+        "예측 시작일",
+        value=default_start,
+        min_value=min_select_date,
+        max_value=max_select_date,
+        help="Open-Meteo Historical Weather API와 Forecast API가 지원하는 범위 안에서 선택할 수 있습니다.",
     )
     start_user = pd.Timestamp.combine(site_start, pd.Timestamp("00:00").time())
-    st.caption("예측 시작시간은 00:00으로 고정됩니다.")
 
-    site_days = st.slider("예측 일수", min_value=3, max_value=16, value=7)
-
-    water_source_options = list(WATER_SOURCE_PARAMS.keys())
-    water_source = st.selectbox(
-        "급수 공급원",
-        options=water_source_options,
-        index=water_source_options.index("지중매설 (1m+)"),
+    max_end_by_period = (
+        pd.Timestamp(site_start) + pd.Timedelta(days=MAX_SIMULATION_DAYS - 1)
+    ).date()
+    max_end_date = min(max_select_date, max_end_by_period)
+    default_end = min(
+        (pd.Timestamp(site_start) + pd.Timedelta(days=6)).date(),
+        max_end_date,
+    )
+    site_end = st.date_input(
+        "예측 종료일",
+        value=default_end,
+        min_value=site_start,
+        max_value=max_end_date,
+        help="종료일은 계산에 포함됩니다. 현재 엔진 구조상 한 번에 최대 366일까지 계산합니다.",
+    )
+    end_user = pd.Timestamp.combine(site_end, pd.Timestamp("00:00").time()) + pd.Timedelta(days=1)
+    site_days = int((end_user - start_user).days)
+    st.caption(
+        f"예측 시간은 시작일 00:00부터 종료일 23:00까지입니다. 선택 기간: {site_days}일"
     )
 
 # --- 4. 메인 화면 레이아웃 ---
@@ -308,15 +444,29 @@ with tab_input:
         )
         cop_c = st.number_input(
             "냉방기 COP",
-            value=float(eb.get("cop_c", 3.8)),
+            value=float(eb.get("cop_c", DEFAULT_COOLING_COP)),
             min_value=0.1,
             step=0.1,
         )
         cop_h = st.number_input(
             "난방기 COP",
-            value=float(eb.get("cop_h", 3.2)),
+            value=float(eb.get("cop_h", DEFAULT_HEATING_COP)),
             min_value=0.1,
             step=0.1,
+        )
+        heating_capacity_kw = st.number_input(
+            "난방기 용량 [kW]",
+            value=float(eb.get("heating_capacity_kw", DEFAULT_HEATING_CAPACITY_KW)),
+            min_value=0.1,
+            step=1.0,
+            help="히트펌프가 공급할 수 있는 최대 난방 열출력입니다.",
+        )
+        cooling_capacity_kw = st.number_input(
+            "냉방기 용량 [kW]",
+            value=float(eb.get("cooling_capacity_kw", DEFAULT_COOLING_CAPACITY_KW)),
+            min_value=0.1,
+            step=1.0,
+            help="히트펌프가 공급할 수 있는 최대 냉방 열출력입니다.",
         )
 
         if use_type == "식당":
@@ -351,50 +501,66 @@ with tab_input:
             max_value=23,
             disabled=(use_type == "식당"),
         )
-        sat_mode = st.selectbox(
-            "토요일 운영",
+        saved_weekend_mode = eb.get("weekend_mode")
+        if saved_weekend_mode not in WEEKEND_MODES:
+            saved_sat = eb.get("sat_mode", preset.sat_mode)
+            saved_sun = eb.get("sun_mode", preset.sun_mode)
+            saved_weekend_mode = saved_sat if saved_sat == saved_sun else preset.sun_mode
+        if saved_weekend_mode not in WEEKEND_MODES:
+            saved_weekend_mode = "없음(OFF)"
+        weekend_mode = st.selectbox(
+            "주말 운영",
             options=WEEKEND_MODES,
-            index=WEEKEND_MODES.index(
-                eb.get("sat_mode", preset.sat_mode)
-            ),
+            index=WEEKEND_MODES.index(saved_weekend_mode),
+            help="pybuildingenergy는 토요일과 일요일을 하나의 주말 프로파일로 계산하므로 동일한 주말 운영 조건을 적용합니다.",
         )
-        sun_mode = st.selectbox(
-            "일요일 운영",
-            options=WEEKEND_MODES,
-            index=WEEKEND_MODES.index(
-                eb.get("sun_mode", preset.sun_mode)
-            ),
-        )
+        sat_mode = weekend_mode
+        sun_mode = weekend_mode
 
     with col3:
         st.markdown("##### 🚰 온수 및 환기")
-        dhw_facility_options = DHW_FACILITY_TYPES
-        saved_dhw_facility = eb.get("dhw_facility", preset.default_dhw_facility)
-        saved_dhw_facility = {
-            "없음": "세면",
-            "샤워·세면": "샤워",
-            "샤워+주방": "주방+샤워",
-        }.get(saved_dhw_facility, saved_dhw_facility)
-        if saved_dhw_facility not in dhw_facility_options:
-            saved_dhw_facility = preset.default_dhw_facility
-        dhw_facility = st.selectbox(
-            "온수 시설 유형",
-            options=dhw_facility_options,
-            index=dhw_facility_options.index(saved_dhw_facility),
-        )
+        dhw_facility = {
+            "사무실": "세면",
+            "작업장": "세면",
+            "숙소": "샤워",
+            "식당": "주방",
+        }.get(use_type, "세면")
         dhw_heater_type = st.selectbox(
             "온수기 종류",
             options=DHW_HEATER_TYPES,
             index=DHW_HEATER_TYPES.index(
-                eb.get("dhw_heater_type", preset.default_dhw_heater)
+                normalize_dhw_heater_type(eb.get("dhw_heater_type", preset.default_dhw_heater))
             ),
         )
 
-        est_persons = estimate_persons(area_m2, use_type)
+        default_persons = default_persons_for_use(area_m2, use_type)
+        dhw_person_label = "1일 급식 인원" if use_type == "식당" else "재실 인원"
         dhw_persons = st.number_input(
-            f"재실 인원 (0 입력시 자동추정: {est_persons}명)",
-            value=int(eb.get("dhw_persons", 0)),
-            min_value=0,
+            dhw_person_label,
+            value=int(eb.get("dhw_persons", default_persons)),
+            min_value=1,
+            help=(
+                "식당 온수부하는 상시 재실자보다 식수 인원 영향이 크므로 1일 급식 인원을 사용합니다."
+                if use_type == "식당"
+                else None
+            ),
+        )
+        dhw_capacity_kw = st.number_input(
+            "온수기 용량 [kW]",
+            value=float(eb.get("dhw_capacity_kw", DEFAULT_DHW_BOILER_CAPACITY_KW)),
+            min_value=0.0,
+            step=0.1,
+            help="전기보일러는 정격 소비전력, 가스보일러/외부공급은 공급 가능한 열용량 기준입니다. 0이면 용량 제한을 적용하지 않습니다.",
+        )
+        water_source_options = list(WATER_SOURCE_PARAMS.keys())
+        water_source = st.selectbox(
+            "급수 공급원",
+            options=water_source_options,
+            index=water_source_options.index(
+                eb.get("water_source", "지중매설 (1m+)")
+                if eb.get("water_source", "지중매설 (1m+)") in water_source_options
+                else "지중매설 (1m+)"
+            ),
         )
 
         mechanical_vent = st.checkbox(
@@ -410,13 +576,25 @@ with tab_input:
 
         # 식당 전용 후드 배기 설정
         if use_type == "식당":
-            kitchen_exh = st.number_input(
-                "주방 후드 배기 [m³/h]",
-                value=float(
-                    eb.get("kitchen_exh", preset.kitchen_exh_m3h)
-                ),
+            kitchen_exh_auto = st.checkbox(
+                "주방 후드 배기 자동추정",
+                value=bool(eb.get("kitchen_exh_auto", True)),
             )
+            estimated_kitchen_exh = estimate_kitchen_exhaust_m3h(area_m2, dhw_persons)
+            if kitchen_exh_auto:
+                kitchen_exh = estimated_kitchen_exh
+                st.caption(f"자동추정값: {kitchen_exh:,.0f} m³/h")
+            else:
+                kitchen_exh = st.number_input(
+                    "주방 후드 배기 [m³/h]",
+                    value=float(
+                        eb.get("kitchen_exh", estimated_kitchen_exh)
+                    ),
+                    min_value=0.0,
+                    step=50.0,
+                )
         else:
+            kitchen_exh_auto = False
             kitchen_exh = 0.0
 
     # 고급 설정: 접이식 패널 (Expanders)
@@ -445,20 +623,37 @@ with tab_input:
             )
         with ae_col2:
             roof_u = st.number_input(
-                "지붕 열관류율 [W/m²K]", value=float(eb.get("roof_u", 0.35))
+                "지붕 열관류율 [W/m²K]", value=float(eb.get("roof_u", DEFAULT_ROOF_U))
             )
             wall_u = st.number_input(
-                "외벽 열관류율 [W/m²K]", value=float(eb.get("wall_u", 0.50))
+                "외벽 열관류율 [W/m²K]", value=float(eb.get("wall_u", DEFAULT_WALL_U))
             )
             slab_u = st.number_input(
-                "바닥 열관류율 [W/m²K]", value=float(eb.get("slab_u", 0.80))
+                "바닥 열관류율 [W/m²K]", value=float(eb.get("slab_u", DEFAULT_SLAB_U))
             )
+            door_u = st.number_input(
+                "문 열관류율 [W/m²K]", value=float(eb.get("door_u", DEFAULT_DOOR_U))
+            )
+            default_door_ratio = float(
+                eb.get(
+                    "door_area_ratio_pct",
+                    100.0 * float(eb.get("door_area_m2", DEFAULT_DOOR_AREA_M2)) / max(float(area_m2), 1.0),
+                )
+            )
+            door_area_ratio_pct = st.number_input(
+                "문 면적 비율 [%]",
+                value=default_door_ratio,
+                min_value=0.0,
+                step=0.1,
+                help="바닥면적 대비 문 면적 비율입니다. 기본 0.75%는 800 m² 기준 약 6 m²입니다.",
+            )
+            door_area_m2 = float(area_m2) * float(door_area_ratio_pct) / 100.0
             win_u = st.number_input(
-                "창호 열관류율 [W/m²K]", value=float(eb.get("win_u", 3.5))
+                "창호 열관류율 [W/m²K]", value=float(eb.get("win_u", DEFAULT_WINDOW_U))
             )
             win_g = st.number_input(
                 "창호 SHGC (g-value) [-]",
-                value=float(eb.get("win_g", 0.65)),
+                value=float(eb.get("win_g", DEFAULT_WINDOW_G)),
             )
 
     # 데이터 수집 및 등록
@@ -477,12 +672,16 @@ with tab_input:
         "hvac_end": hvac_end,
         "sat_mode": sat_mode,
         "sun_mode": sun_mode,
+        "weekend_mode": weekend_mode,
         "dhw_facility": dhw_facility,
         "dhw_heater_type": dhw_heater_type,
         "dhw_persons": dhw_persons,
+        "dhw_capacity_kw": dhw_capacity_kw,
+        "water_source": water_source,
         "mechanical_vent": mechanical_vent,
         "oa_m3h": oa_m3h,
         "kitchen_exh": kitchen_exh,
+        "kitchen_exh_auto": kitchen_exh_auto,
         "meal_bfst": meal_bfst,
         "meal_lunch": meal_lunch,
         "meal_dinner": meal_dinner,
@@ -493,6 +692,9 @@ with tab_input:
         "roof_u": roof_u,
         "wall_u": wall_u,
         "slab_u": slab_u,
+        "door_u": door_u,
+        "door_area_ratio_pct": door_area_ratio_pct,
+        "door_area_m2": door_area_m2,
         "win_u": win_u,
         "win_g": win_g,
         # 기본 fallback 값 처리
@@ -500,6 +702,8 @@ with tab_input:
         "gains_end": preset.gains_end,
         "cop_h": cop_h,
         "cop_c": cop_c,
+        "heating_capacity_kw": heating_capacity_kw,
+        "cooling_capacity_kw": cooling_capacity_kw,
         "vent_start": 8,
         "vent_end": 18,
         "fan_sp": 0.0,
@@ -547,7 +751,7 @@ with tab_list:
                     "용도": b["use_type"],
                     "면적 [m²]": b["area_m2"],
                     "층수": b["floors"],
-                    "주말운영": f"토:{b['sat_mode'][:3]}/일:{b['sun_mode'][:3]}",
+                    "주말운영": b.get("weekend_mode", b.get("sat_mode", "")),
                 }
             )
 
@@ -587,19 +791,24 @@ with tab_list:
         # 시뮬레이션 가동 버튼
         if st.button("🚀 전체 시뮬레이션 계산 실행", type="primary", use_container_width=True):
             buildings = st.session_state.buildings
-            epw_year = 2009
+            epw_year = choose_simulation_year(start_user, end_user)
 
             # 7. Core Logic - 뷰 및 진행 상황 바
             with st.status("물리 엔진 시뮬레이션 진행 중...", expanded=True) as status:
                 try:
+                    spinup_days = max(0, int(SIMULATION_SPINUP_DAYS))
+                    sim_extract_start = start_user - pd.Timedelta(days=spinup_days)
+                    sim_extract_days = int(site_days) + spinup_days
+                    weather_start = sim_extract_start - pd.Timedelta(days=WEATHER_PRELOAD_DAYS)
+                    weather_end = end_user
+
                     # Step A: 기상 데이터 수집
                     status.write("📡 Step A: Open-Meteo 기상 수집 중...")
-                    df_open, wmeta = cached_fetch_weather(site_lat, site_lon)
-
-                    # Step B: 급수 온도 계산
-                    status.write("💧 Step B: 급수 온도 계산 중...")
-                    t_supply, freeze_warns = calc_supply_temp_series(
-                        df_open, water_source
+                    df_open, wmeta = cached_fetch_weather(
+                        site_lat,
+                        site_lon,
+                        weather_start.isoformat(),
+                        weather_end.isoformat(),
                     )
 
                     # Step C: EPW 생성
@@ -608,14 +817,17 @@ with tab_list:
                         df_open, wmeta, epw_year
                     )
 
-                    end_user = start_user + pd.Timedelta(days=int(site_days))
-                    wu_start = start_user - pd.Timedelta(days=2)
-                    ws_sim = _safe_replace_year(wu_start, epw_year)
+                    ws_sim = _safe_replace_year(weather_start, epw_year)
                     we_sim = _safe_replace_year(end_user, epw_year)
 
                     tmp_dir = tempfile.mkdtemp()
                     epw_path = os.path.join(tmp_dir, f"om_{epw_year}.epw")
-                    write_epw_8760_from_open_meteo(base_8760, wmeta, epw_path)
+                    write_epw_8760_from_open_meteo(
+                        base_8760,
+                        wmeta,
+                        epw_path,
+                        compensate_pybui_tz_roll=True,
+                    )
 
                     # Step D: 건물별 시뮬레이션
                     bldg_results = {}
@@ -629,9 +841,13 @@ with tab_list:
                         )
 
                         area_m2 = bp["area_m2"]
+                        water_source_b = bp.get("water_source", "지중매설 (1m+)")
+                        t_supply, freeze_warns = calc_supply_temp_series(
+                            df_open, water_source_b
+                        )
                         dhw_persons = bp["dhw_persons"]
                         if dhw_persons <= 0:
-                            dhw_persons = estimate_persons(area_m2, ut)
+                            dhw_persons = default_persons_for_use(area_m2, ut)
                         occ_ratio = min(
                             1.0, dhw_persons / max(1, estimate_persons(area_m2, ut))
                         )
@@ -681,12 +897,20 @@ with tab_list:
                             roof_u=bp["roof_u"],
                             wall_u=bp["wall_u"],
                             slab_u=bp["slab_u"],
+                            door_u=bp.get("door_u", DEFAULT_DOOR_U),
+                            door_area_m2=bp.get("door_area_m2", DEFAULT_DOOR_AREA_M2),
                             win_u=bp["win_u"],
                             win_g=bp["win_g"],
                             heat_set=bp["heat_set"],
                             cool_set=bp["cool_set"],
                             hvac_start=hvac_start,
                             hvac_end=hvac_end,
+                            heating_capacity_kw=bp.get(
+                                "heating_capacity_kw", DEFAULT_HEATING_CAPACITY_KW
+                            ),
+                            cooling_capacity_kw=bp.get(
+                                "cooling_capacity_kw", DEFAULT_COOLING_CAPACITY_KW
+                            ),
                             gains_start=gains_start,
                             gains_end=gains_end,
                             internal_gain_heat_wm2=bp["gain_heat"],
@@ -723,13 +947,14 @@ with tab_list:
                             fan_sp=bp["fan_sp"],
                             t_supply=t_supply,
                             facility_type=bp["dhw_facility"],
-                            heater_type=bp["dhw_heater_type"],
+                            heater_type=normalize_dhw_heater_type(bp["dhw_heater_type"]),
                             persons=dhw_persons,
                             shower_lpd=fp["shower_lpd"],
                             shower_t_hot=bp["dhw_t_hot_shower"],
                             kitchen_lpd=fp["kitchen_lpd"],
                             kitchen_t_hot=bp["dhw_t_hot_kitchen"],
                             dhw_cop=bp["dhw_cop"],
+                            dhw_capacity_kw=bp.get("dhw_capacity_kw", DEFAULT_DHW_BOILER_CAPACITY_KW),
                             use_type=ut,
                             occupancy_ratio=occ_ratio,
                             df_open=df_open,
@@ -738,9 +963,16 @@ with tab_list:
                             restaurant_gains_prof=restaurant_gains_prof,
                         )
 
-                        df_out = extract_user_period(
-                            df_year, df_open, start_user, site_days, sim_year
+                        df_spin = extract_user_period(
+                            df_year,
+                            df_open,
+                            sim_extract_start,
+                            sim_extract_days,
+                            sim_year,
                         )
+                        df_out = df_spin.loc[
+                            (df_spin.index >= start_user) & (df_spin.index < end_user)
+                        ].copy()
                         bldg_results[nm] = df_out
 
                     # 임시 파일 정리
@@ -773,12 +1005,14 @@ with tab_list:
                         .sum()
                     )
 
-                    sp_param = WATER_SOURCE_PARAMS.get(water_source, {})
+                    meta_water_source = buildings[0].get("water_source", "지중매설 (1m+)") if buildings else "지중매설 (1m+)"
+                    t_supply_meta, _ = calc_supply_temp_series(df_open, meta_water_source)
+                    sp_param = WATER_SOURCE_PARAMS.get(meta_water_source, {})
                     df_note = ""
                     if sp_param.get("soil_col") is not None:
                         df_note = f' (depth_factor={sp_param.get("depth_factor",1.0)}, 54cm 기반)'
 
-                    t_s_p = t_supply.reindex(df_total.index, method="nearest")
+                    t_s_p = t_supply_meta.reindex(df_total.index, method="nearest")
 
                     st.session_state.last_result = {
                         "bldg_results": bldg_results,
@@ -787,7 +1021,11 @@ with tab_list:
                             "start": start_user,
                             "end": end_user,
                             "timezone": wmeta.get("timezone", ""),
-                            "water_source": water_source,
+                            "weather_source": wmeta.get("source", ""),
+                            "weather_start": wmeta.get("weather_start", ""),
+                            "weather_end": wmeta.get("weather_end", ""),
+                            "spinup_days": spinup_days,
+                            "water_source": meta_water_source,
                             "t_sup_mean": float(t_s_p.mean()),
                             "t_sup_min": float(t_s_p.min()),
                             "t_sup_max": float(t_s_p.max()),
@@ -824,77 +1062,79 @@ with tab_result:
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         total_site_kwh = df_total["Total_Elec_kWh"].sum()
         peak_site_kw = df_total["Total_Elec_kWh"].max()
+        peak_site_time = df_total["Total_Elec_kWh"].idxmax()
 
         kpi1.metric(
             label="현장 총 소비 전력량", value=f"{total_site_kwh:,.1f} kWh"
         )
         kpi2.metric(label="현장 피크 전력 수요", value=f"{peak_site_kw:,.2f} kW")
         kpi3.metric(
-            label="급수 평균 온도", value=f"{meta['t_sup_mean']:.1f} °C"
+            label="현장 피크 시간", value=peak_site_time.strftime("%m-%d %H:%M")
         )
-        kpi4.metric(
-            label="최저/최고 급수 온도",
-            value=f"{meta['t_sup_min']:.1f} / {meta['t_sup_max']:.1f} °C",
-        )
+        kpi4.metric(label="급수 평균 온도", value=f"{meta['t_sup_mean']:.1f} °C")
 
         st.divider()
 
         # 시각화 영역
-        st.subheader("💡 비중 및 시간별 전력 수요 분석")
-        chart_col1, chart_col2 = st.columns([1, 2])
-
-        with chart_col1:
-            # 1. 파이 차트: 건물별 전력량 비중
-            pie_data = {
-                nm: df["Total_Elec_kWh"].sum()
-                for nm, df in bldg_results.items()
-            }
-            fig_pie = px.pie(
-                values=list(pie_data.values()),
-                names=list(pie_data.keys()),
-                title="건물별 전력 사용량 비중",
-                hole=0.4,
-                color_discrete_sequence=px.colors.qualitative.Pastel,
+        st.subheader("📈 예측기간 시간별 전력수요")
+        fig_line = go.Figure()
+        fig_line.add_trace(
+            go.Scatter(
+                x=df_total.index,
+                y=df_total["Total_Elec_kWh"],
+                mode="lines",
+                name="현장 총 전력",
+                fill="tozeroy",
+                line=dict(color="#1F4E79", width=3),
             )
-            fig_pie.update_layout(showlegend=True)
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        with chart_col2:
-            # 2. 라인 차트: 시간별 현장 합계 전력 수요
-            fig_line = go.Figure()
+        )
+        # 주요 용도별 데이터 추가
+        for sub, label in [
+            ("HVAC_Elec_kWh", "냉난방"),
+            ("Lighting_Elec_kWh", "조명"),
+            ("Equip_Elec_kWh", "콘센트"),
+            ("DHW_Elec_kWh", "온수"),
+        ]:
             fig_line.add_trace(
                 go.Scatter(
                     x=df_total.index,
-                    y=df_total["Total_Elec_kWh"],
+                    y=df_total[sub],
                     mode="lines",
-                    name="현장 총 전력 (kWh)",
-                    fill="tozeroy",
-                    line=dict(color="#1F4E79", width=2),
+                    name=label,
+                    line=dict(width=1.5, dash="dot"),
                 )
             )
-            # 주요 용도별 데이터 추가
-            for sub in [
-                "HVAC_Elec_kWh",
-                "Lighting_Elec_kWh",
-                "DHW_Elec_kWh",
-            ]:
-                fig_line.add_trace(
-                    go.Scatter(
-                        x=df_total.index,
-                        y=df_total[sub],
-                        mode="lines",
-                        name=sub.replace("_Elec_kWh", ""),
-                        line=dict(width=1, dash="dot"),
-                    )
-                )
 
-            fig_line.update_layout(
-                title="예측 기간 시간별 전력 수요 (Load Profile)",
-                xaxis_title="날짜 및 시각",
-                yaxis_title="전력량 [kWh]",
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_line, use_container_width=True)
+        fig_line.update_layout(
+            xaxis_title="날짜 및 시각",
+            yaxis_title="전력수요 [kW]",
+            hovermode="x unified",
+            height=480,
+            margin=dict(l=20, r=20, t=20, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_line, use_container_width=True)
+
+        st.divider()
+
+        st.subheader("🗓️ 예측 날짜별 시간대 총 전력 사용량")
+        heatmap_df = df_total[["Total_Elec_kWh"]].copy()
+        heatmap_df["날짜"] = heatmap_df.index.strftime("%Y-%m-%d")
+        heatmap_df["시간"] = heatmap_df.index.hour
+        heatmap_table = heatmap_df.pivot_table(
+            index="날짜",
+            columns="시간",
+            values="Total_Elec_kWh",
+            aggfunc="sum",
+        ).reindex(columns=range(24))
+        heatmap_table.columns = [f"{h:02d}시" for h in heatmap_table.columns]
+        st.dataframe(
+            heatmap_table.style.format("{:.1f}").background_gradient(
+                cmap="Reds", axis=None
+            ),
+            use_container_width=True,
+            height=min(420, 74 + 35 * len(heatmap_table)),
+        )
 
         st.divider()
 
@@ -907,10 +1147,27 @@ with tab_result:
                     "건물명": nm,
                     "총 전력량 [kWh]": round(df_b["Total_Elec_kWh"].sum(), 1),
                     "냉난방 (HVAC)": round(df_b["HVAC_Elec_kWh"].sum(), 1),
+                    "조명": round(df_b["Lighting_Elec_kWh"].sum(), 1),
+                    "콘센트": round(df_b["Equip_Elec_kWh"].sum(), 1),
+                    "팬": round(df_b["Fan_Elec_kWh"].sum(), 1),
                     "급탕 (DHW)": round(df_b["DHW_Elec_kWh"].sum(), 1),
                     "피크 부하 [kW]": round(df_b["Total_Power_kW"].max(), 2),
+                    "피크 시간": df_b["Total_Power_kW"].idxmax().strftime("%m-%d %H:%M"),
                 }
             )
+        bldg_det.append(
+            {
+                "건물명": "합계",
+                "총 전력량 [kWh]": round(df_total["Total_Elec_kWh"].sum(), 1),
+                "냉난방 (HVAC)": round(df_total["HVAC_Elec_kWh"].sum(), 1),
+                "조명": round(df_total["Lighting_Elec_kWh"].sum(), 1),
+                "콘센트": round(df_total["Equip_Elec_kWh"].sum(), 1),
+                "팬": round(df_total["Fan_Elec_kWh"].sum(), 1),
+                "급탕 (DHW)": round(df_total["DHW_Elec_kWh"].sum(), 1),
+                "피크 부하 [kW]": round(df_total["Total_Elec_kWh"].max(), 2),
+                "피크 시간": df_total["Total_Elec_kWh"].idxmax().strftime("%m-%d %H:%M"),
+            }
+        )
         st.dataframe(
             pd.DataFrame(bldg_det), use_container_width=True, hide_index=True
         )
@@ -919,28 +1176,33 @@ with tab_result:
 
         # 다운로드 영역
         st.subheader("📥 데이터 다운로드")
+        with st.spinner("결과 파일을 준비 중입니다..."):
+            excel_buf = generate_excel_buffer(res)
+            csv_site = df_total.to_csv().encode("utf-8-sig")
+
+        if AUTO_SAVE_RESULT_FILES:
+            saved_paths = save_result_files_to_outputs(excel_buf, csv_site)
+            st.success(
+                "결과 파일이 outputs 폴더에 새 파일명으로 자동 저장되었습니다. "
+                f"Excel: {saved_paths['excel']} / CSV: {saved_paths['csv']}"
+            )
+
         col_dw1, col_dw2 = st.columns(2)
 
         with col_dw1:
-            # Excel 다운로드
-            with st.spinner("Excel 파일을 준비 중입니다..."):
-                excel_buf = generate_excel_buffer(res)
-
             st.download_button(
                 label="📥 통합 결과 Excel 파일 다운로드",
                 data=excel_buf.getvalue(),
-                file_name=f"forecast_energy_results.xlsx",
+                file_name=AUTO_SAVE_EXCEL_NAME,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
 
         with col_dw2:
-            # CSV 다운로드
-            csv_site = df_total.to_csv().encode("utf-8")
             st.download_button(
                 label="📥 현장 합계 CSV 파일 다운로드",
                 data=csv_site,
-                file_name="forecast_site_hourly.csv",
+                file_name=AUTO_SAVE_CSV_NAME,
                 mime="text/csv",
                 use_container_width=True,
             )

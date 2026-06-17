@@ -25,8 +25,9 @@ OCCUPANT_DENSITY: Dict[str, float] = {
     '작업장': 15.0,   # ISO 18523-1 Annex D: 10~20 m²/person (중공업 기준)
 }
 
-# 주말 운영 모드 (토·일 각각 독립 선택)
-WEEKEND_MODES = ['없음(OFF)', '오전 운영(06~13h)', '평일 동일']
+# pybuildingenergy는 토·일을 하나의 weekend 프로파일로 처리한다.
+# 앱 UI도 계산 엔진과 맞춰 주말 미운영/평일 동일만 제공한다.
+WEEKEND_MODES = ['없음(OFF)', '평일 동일']
 
 # 식당 식사 제공 시간대 (준비 시작h, 서비스 종료h, 피크 시간 리스트)
 MEAL_WINDOWS: Dict[str, tuple] = {
@@ -140,8 +141,8 @@ class UsePreset:
     base_infil_ach: float
     oa_m3h:         float
     kitchen_exh_m3h: float
-    # 주말 운영 모드 (토·일 독립)
-    sat_mode: str   # '없음(OFF)' / '오전 운영(06~13h)' / '평일 동일'
+    # 주말 운영 모드. pybuildingenergy 제약에 맞춰 토·일 동일 적용
+    sat_mode: str   # '없음(OFF)' / '평일 동일'
     sun_mode: str   # 동일 선택지
     # 식당 식사 제공 여부 (식당 용도에서만 사용)
     meal_bfst:  bool    # 조식 제공 여부
@@ -162,7 +163,7 @@ PRESETS: Dict[str, UsePreset] = {
         base_infil_ach=0.7, oa_m3h=0.0, kitchen_exh_m3h=0.0,
         sat_mode='없음(OFF)', sun_mode='없음(OFF)',
         meal_bfst=False, meal_lunch=False, meal_dinner=False,
-        default_dhw_facility='세면', default_dhw_heater='없음',
+        default_dhw_facility='세면', default_dhw_heater='전기보일러',
     ),
     # ── 숙소 ────────────────────────────────────────────────────
     # ISO 18523-2:2018 Annex C 기준 / 24h 7일 연속 운영
@@ -208,31 +209,18 @@ PRESETS: Dict[str, UsePreset] = {
 # 온수기 상수
 # ============================================================
 
-DHW_HEATER_TYPES = [
-    '전기저항식(저장)', '전기저항식(순간)', '히트펌프',
-    '가스온수기', '외부공급', '없음',
-]
+DHW_HEATER_TYPES = ['전기보일러', '가스보일러', '외부공급', '없음']
 
 DHW_HEATER_DEFAULTS: Dict[str, Dict] = {
-    '전기저항식(저장)': {
+    '전기보일러': {
         'cop': 0.93, 't_hot_shower': 60.0, 't_hot_kitchen': 80.0,
         'is_electric': True,
-        'note': '저장식 60°C 유지 — 레지오넬라균 위생 기준 (WHO)',
+        'note': '전기보일러 — 전기소비 계산',
     },
-    '전기저항식(순간)': {
-        'cop': 0.95, 't_hot_shower': 45.0, 't_hot_kitchen': 80.0,
-        'is_electric': True,
-        'note': '순간식 — 저장 불필요, 사용점 온도 45°C 권장',
-    },
-    '히트펌프': {
-        'cop': 3.0,  't_hot_shower': 55.0, 't_hot_kitchen': 80.0,
-        'is_electric': True,
-        'note': '히트펌프 — 고효율 (COP 2.5~4.0), 겨울 성능 저하 주의',
-    },
-    '가스온수기': {
+    '가스보일러': {
         'cop': 0.88, 't_hot_shower': 45.0, 't_hot_kitchen': 80.0,
         'is_electric': False,
-        'note': '가스 — 전기소비=0, 가스 열량만 참고 출력 (효율 0.85~0.92)',
+        'note': '가스보일러 — 전기소비=0, 온수 열량만 참고',
     },
     '외부공급': {
         'cop': 0.0,  't_hot_shower': 60.0, 't_hot_kitchen': 80.0,
@@ -243,6 +231,27 @@ DHW_HEATER_DEFAULTS: Dict[str, Dict] = {
         'cop': 0.0,  't_hot_shower': 0.0, 't_hot_kitchen': 0.0,
         'is_electric': False,
         'note': '온수 없음 — 계산 제외',
+    },
+    # 이전 저장값 호환
+    '전기저항식(저장)': {
+        'cop': 0.93, 't_hot_shower': 60.0, 't_hot_kitchen': 80.0,
+        'is_electric': True,
+        'note': '전기보일러와 동일하게 처리',
+    },
+    '전기저항식(순간)': {
+        'cop': 0.95, 't_hot_shower': 45.0, 't_hot_kitchen': 80.0,
+        'is_electric': True,
+        'note': '전기보일러와 동일하게 처리',
+    },
+    '히트펌프': {
+        'cop': 3.0, 't_hot_shower': 55.0, 't_hot_kitchen': 80.0,
+        'is_electric': True,
+        'note': '전기보일러와 동일하게 전기소비 계산',
+    },
+    '가스온수기': {
+        'cop': 0.88, 't_hot_shower': 45.0, 't_hot_kitchen': 80.0,
+        'is_electric': False,
+        'note': '가스보일러와 동일하게 처리',
     },
 }
 
